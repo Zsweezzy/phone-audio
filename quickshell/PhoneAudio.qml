@@ -13,6 +13,7 @@
 //     PhoneAudio.volume       volume 0-100 (-1 when unknown)
 //     PhoneAudio.reason       human note when something needs attention
 //     PhoneAudio.toggle()     flip the routing on/off
+//     PhoneAudio.setVolume(v) set volume to v (0-100)
 
 pragma Singleton
 import QtQuick
@@ -64,6 +65,21 @@ Singleton {
         stdinEnabled: false
     }
 
+    // Volume moves arrive faster than the CLI can spawn processes, so a move
+    // that lands while one is in flight is dropped rather than queued. The
+    // 1s status poll reflects the last applied value, so the next poll picks
+    // up where the slider ended even if an intermediate move was skipped.
+    Process {
+        id: actionVolume
+        command: ["phone-audio", "volume", "0"]
+        stdinEnabled: false
+    }
+
     function refresh() { if (!query.running) query.running = true }
     function toggle() { if (!action.running) action.running = true }
+    function setVolume(value: real): void {
+        if (actionVolume.running) return
+        actionVolume.command = ["phone-audio", "volume", String(Math.round(value))]
+        actionVolume.running = true
+    }
 }
