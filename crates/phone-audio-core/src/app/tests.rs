@@ -148,35 +148,51 @@ fn one_phone_dump(profile: &str) -> CmdOut {
 }
 
 fn enum_profiles_text() -> &'static str {
-    r#"	id 0
-	type PipeWire:Interface:Device
-	cookie 32692
-	bound-id 17
-	object.serial 34566
-	object.path "bluez:/org/bluez/hci0/dev_28_8F_F6_71_6F_6E"
-	param EnumProfile:
-		index:		0
-		name:		"off"
-		description:	"Off"
-		priority:	0
-		available:	Id 1
-		classes:
-			String "Audio/Sink"
-			String "Audio/Source"
-		index:		1
-		name:		"a2dp-sink"
-		description:	"High Fidelity Playback (A2DP Sink)"
-		priority:	19000
-		available:	Id 2
-		classes:
-			String "Audio/Sink"
-		index:		2
-		name:		"a2dp-source"
-		description:	"High Fidelity Capture (A2DP Source)"
-		priority:	19500
-		available:	Id 2
-		classes:
-			String "Audio/Source"
+    r#"  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int 0
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "off"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "Off"
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id 1        (Spa:Enum:ParamAvailability:no)
+    Prop: key Spa:Pod:Object:Param:Profile:classes (7), flags 00000000
+      Struct: size 224
+        Int 1
+        Struct: size 96
+          String "Audio/Sink"
+          Int 1
+  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int 1
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "a2dp-sink"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "High Fidelity Playback (A2DP Sink)"
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id 2        (Spa:Enum:ParamAvailability:yes)
+    Prop: key Spa:Pod:Object:Param:Profile:classes (7), flags 00000000
+      Struct: size 224
+        Int 1
+        Struct: size 96
+          String "Audio/Sink"
+          Int 1
+  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int 2
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "a2dp-source"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "High Fidelity Capture (A2DP Source)"
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id 2        (Spa:Enum:ParamAvailability:yes)
+    Prop: key Spa:Pod:Object:Param:Profile:classes (7), flags 00000000
+      Struct: size 224
+        Int 1
+        Struct: size 96
+          String "Audio/Source"
+          Int 1
 "#
 }
 

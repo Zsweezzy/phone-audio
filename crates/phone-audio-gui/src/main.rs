@@ -112,9 +112,12 @@ impl Gui {
         }
         match app.list_phones() {
             Ok(phones) => {
+                let options: Vec<String> = phones.iter().map(|p| p.to_string()).collect();
+                // Rebuild only on an actual change so an open dropdown survives ticks.
+                if self.combo.options() != options.as_slice() {
+                    self.combo = combo_box::State::with_selection(options, self.selection.as_ref());
+                }
                 self.phones = phones;
-                let options: Vec<String> = self.phones.iter().map(|p| p.to_string()).collect();
-                self.combo = combo_box::State::with_selection(options, self.selection.as_ref());
             }
             Err(e) if self.error.is_none() => self.error = Some(e.to_string()),
             Err(_) => {}

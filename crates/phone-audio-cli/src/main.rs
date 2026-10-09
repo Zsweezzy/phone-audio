@@ -89,8 +89,14 @@ fn run(cmd: Command) -> phone_audio_core::Result<()> {
             let p = app.set_phone(&name_or_mac)?;
             println!("using {}", p);
         }
-        Command::On => app.turn_on()?,
-        Command::Off => app.turn_off()?,
+        Command::On => {
+            app.turn_on()?;
+            println!("Routing: on");
+        }
+        Command::Off => {
+            app.turn_off()?;
+            println!("Routing: off");
+        }
         Command::Toggle => {
             let on = app.toggle()?;
             println!("{}", if on { "on" } else { "off" });

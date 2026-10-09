@@ -65,6 +65,37 @@ Only one abstraction is allowed out of the core: every external command goes
 through `CmdRunner`. That is what makes the whole app testable without a
 phone — the tests script a fake runner.
 
+## Quickshell integration
+
+```sh
+cp quickshell/PhoneAudio.qml ~/.config/quickshell/<your-config>/
+```
+
+Quickshell can't import QML from outside its own folder, so the file must live
+inside the config. Once copied, `PhoneAudio` resolves as a type anywhere in the
+config (it's a `pragma Singleton`); the panel polls `phone-audio status --json`
+itself every second.
+
+```qml
+Text { text: PhoneAudio.summary }
+Button { onClicked: PhoneAudio.toggle() }
+```
+
+## Troubleshooting
+
+- Run `phone-audio debug` first — it dumps phones, nodes, profiles and the
+  loopback state in one place.
+- If no `a2dp-source` profile is listed, inspect
+  `pw-cli enum-params <device-id> EnumProfile` and make sure the WirePlumber
+  bluetooth role config includes `a2dp_source` in `bluez5.roles` (the
+  `api.bluez5.profile` of the card must be switchable to it).
+- After `phone-audio on`, the `bluez_input.<mac>.*` source node only appears
+  once the phone actually streams — if nothing happens, start playback on the
+  phone (the status line repeats this as "not streaming — start playback on
+  the phone").
+- `phone-audio status --json` is the machine-readable surface for scripting
+  and panels.
+
 ## Development
 
 ```sh

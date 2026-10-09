@@ -13,34 +13,65 @@ pub struct Profile {
     pub has_source: bool,
 }
 
-/// Parse `pw-cli enum-params ... EnumProfile` text into profile blocks.
+/// Parse `pw-cli enum-params ... EnumProfile` text (the pod-dump format) into
+/// profile blocks. Tolerant: only looks for the interesting lines.
+///
+/// A new profile starts at a line containing both `Object:` and `Param:Profile`;
+/// within it, `Prop: key ...:index/name/available` lines are followed by
+/// `Int N` / `String "..."` / `Id N` value lines. `Audio/Source` appearing in
+/// the block marks the profile as source-capable.
 pub fn parse_profiles(text: &str) -> Vec<Profile> {
     let mut out = Vec::new();
     let mut cur: Option<Profile> = None;
+    let mut key: Option<&str> = None;
     for line in text.lines() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("index:") {
+        if t.starts_with("Object:") && t.contains("Param:Profile") {
             if let Some(p) = cur.take() {
                 out.push(p);
             }
             cur = Some(Profile {
-                index: rest.trim().parse().unwrap_or(0),
+                index: 0,
                 name: String::new(),
                 available: false,
                 has_source: false,
             });
-        } else if let Some(p) = cur.as_mut() {
-            if let Some(rest) = t.strip_prefix("name:") {
-                p.name = rest.trim().trim_matches('"').to_string();
-            } else if let Some(rest) = t.strip_prefix("available:") {
-                p.available = rest
-                    .split_whitespace()
-                    .last()
-                    .and_then(|s| s.parse::<u32>().ok())
-                    == Some(2);
-            } else if t.contains("Audio/Source") {
-                p.has_source = true;
+            key = None;
+            continue;
+        }
+        let Some(p) = cur.as_mut() else { continue };
+        if let Some(rest) = t.strip_prefix("Prop: key") {
+            // `Spa:Pod:Object:Param:Profile:index (1), flags ...` -> `index`
+            key = rest
+                .split('(')
+                .next()
+                .and_then(|s| s.split(':').next_back())
+                .map(str::trim);
+            continue;
+        }
+        if t.starts_with("String \"Audio/Source\"") {
+            p.has_source = true;
+            continue;
+        }
+        match key {
+            Some("index") => {
+                if let Some(v) = t.strip_prefix("Int ") {
+                    p.index = v.trim().parse().unwrap_or(0);
+                }
             }
+            Some("name") => {
+                if let Some(v) = t.strip_prefix("String ") {
+                    p.name = v.trim().trim_matches('"').to_string();
+                }
+            }
+            Some("available") => {
+                // `Id 2 (Spa:Enum:ParamAvailability:yes)` -> available yes
+                let mut it = t.split_whitespace();
+                if it.next() == Some("Id") {
+                    p.available = it.next().and_then(|s| s.parse::<u32>().ok()) == Some(2);
+                }
+            }
+            _ => {}
         }
     }
     if let Some(p) = cur {
@@ -108,54 +139,134 @@ mod tests {
         assert_eq!(parse_volume(""), None);
     }
 
+    /// The real pod-dump text of `pw-cli enum-params <id> EnumProfile`
+    /// (PipeWire 1.6.9, captured against ALSA device 52).
+    const DEVICE_52: &str = r#"  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int 0
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "off"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "Off"
+    Prop: key Spa:Pod:Object:Param:Profile:priority (4), flags 00000000
+      Int 0
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id 2        (Spa:Enum:ParamAvailability:yes)
+    Prop: key Spa:Pod:Object:Param:Profile:classes (7), flags 00000000
+      Struct: size 224
+        Int 2
+        Struct: size 96
+          String "Audio/Sink"
+          Int 1
+  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int 1
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "output:analog-stereo+input:mono-fallback"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "Analog Stereo Duplex"
+    Prop: key Spa:Pod:Object:Param:Profile:priority (4), flags 00000000
+      Int 6561
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id 0        (Spa:Enum:ParamAvailability:no)
+    Prop: key Spa:Pod:Object:Param:Profile:classes (7), flags 00000000
+      Struct: size 224
+        Int 2
+        Struct: size 96
+          String "Audio/Sink"
+          Int 1
+        Struct: size 96
+          String "Audio/Source"
+          Int 1
+"#;
+
+    #[test]
+    fn parses_real_device_52_enum_output() {
+        let ps = parse_profiles(DEVICE_52);
+        assert_eq!(ps.len(), 2);
+        let off = &ps[0];
+        assert_eq!(off.index, 0);
+        assert_eq!(off.name, "off");
+        assert!(off.available, "Id 2 = available");
+        assert!(!off.has_source, "off has no Audio/Source class");
+        let fallback = &ps[1];
+        assert_eq!(fallback.index, 1);
+        assert_eq!(fallback.name, "output:analog-stereo+input:mono-fallback");
+        assert!(!fallback.available, "Id 0 = unavailable");
+        assert!(fallback.has_source, "duplex exposes Audio/Source");
+    }
+
+    /// One `EnumProfile` object in the pod-dump format.
+    fn obj(index: u32, name: &str, id: u32, classes: &[&str]) -> String {
+        let yes = if id == 2 { "yes" } else { "no" };
+        let mut s = format!(
+            r#"  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int {index}
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "{name}"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "{name}"
+    Prop: key Spa:Pod:Object:Param:Profile:priority (4), flags 00000000
+      Int 0
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id {id}        (Spa:Enum:ParamAvailability:{yes})
+    Prop: key Spa:Pod:Object:Param:Profile:classes (7), flags 00000000
+      Struct: size 224
+        Int {c}
+"#,
+            c = classes.len()
+        );
+        for c in classes {
+            s.push_str(&format!(
+                "        Struct: size 96\n          String \"{c}\"\n          Int 1\n"
+            ));
+        }
+        s
+    }
+
+    /// A realistic bluez card: off, sink/source, duplex, headset, and one
+    /// unavailable profile (Id 0).
+    fn bluez_fixture() -> String {
+        let mut s = String::new();
+        s.push_str(&obj(0, "off", 1, &["Audio/Sink"]));
+        s.push_str(&obj(1, "a2dp-sink", 2, &["Audio/Sink"]));
+        s.push_str(&obj(2, "a2dp-source", 2, &["Audio/Source"]));
+        s.push_str(&obj(3, "a2dp-duplex", 2, &["Audio/Sink", "Audio/Source"]));
+        s.push_str(&obj(
+            4,
+            "headset-head-unit",
+            2,
+            &["Audio/Sink", "Audio/Source"],
+        ));
+        s.push_str(&obj(5, "handsfree", 0, &["Audio/Sink", "Audio/Source"]));
+        s
+    }
+
     #[test]
     fn profiles_parse_fields_and_availability() {
-        let text = r#"id 0
-	type PipeWire:Interface:Device
-	cookie 32692
-	bound-id 17
-	object.serial 34566
-	object.path "bluez:/org/bluez/hci0/dev_28_8F_F6_71_6F_6E"
-	param EnumProfile:
-		index:		0
-		name:		"off"
-		description:	"Off"
-		priority:	0
-		available:	Id 1
-		classes:
-			String "Audio/Sink"
-			String "Audio/Source"
-		index:		1
-		name:		"a2dp-sink"
-		description:	"High Fidelity Playback (A2DP Sink)"
-		priority:	19000
-		available:	Id 2
-		classes:
-			String "Audio/Sink"
-		index:		2
-		name:		"a2dp-source"
-		description:	"High Fidelity Capture (A2DP Source)"
-		priority:	19500
-		available:	Id 2
-		classes:
-			String "Audio/Source"
-"#;
-        let ps = parse_profiles(text);
-        assert_eq!(ps.len(), 3);
+        let ps = parse_profiles(&bluez_fixture());
+        assert_eq!(ps.len(), 6);
         assert_eq!(ps[0].index, 0);
         assert_eq!(ps[0].name, "off");
         assert!(!ps[0].available);
-        assert!(ps[0].has_source);
+        assert!(!ps[0].has_source);
         assert_eq!(ps[1].name, "a2dp-sink");
         assert!(ps[1].available);
         assert!(!ps[1].has_source);
         assert_eq!(ps[2].name, "a2dp-source");
         assert!(ps[2].available && ps[2].has_source);
+        assert_eq!(ps[3].name, "a2dp-duplex");
+        assert!(ps[3].available && ps[3].has_source);
+        assert_eq!(ps[4].name, "headset-head-unit");
+        assert!(ps[4].available && ps[4].has_source);
+        assert_eq!(ps[5].name, "handsfree");
+        assert!(!ps[5].available);
     }
 
     #[test]
     fn pick_prefers_available_a2dp_source() {
-        let ps = parse_profiles(ENUM_TEXT);
+        let ps = parse_profiles(&bluez_fixture());
         assert_eq!(pick_receive_profile(&ps).unwrap().name, "a2dp-source");
     }
 
@@ -183,23 +294,6 @@ mod tests {
         // no source-capable profile at all
         assert!(pick_receive_profile(&[make("off", true, false)]).is_none());
     }
-
-    const ENUM_TEXT: &str = r#"	index:		0
-		name:		"off"
-		available:	Id 1
-		classes:
-			String "Audio/Sink"
-		index:		1
-		name:		"a2dp-sink"
-		available:	Id 2
-		classes:
-			String "Audio/Sink"
-		index:		2
-		name:		"a2dp-source"
-		available:	Id 2
-		classes:
-			String "Audio/Source"
-"#;
 
     fn make(name: &str, available: bool, has_source: bool) -> Profile {
         Profile {

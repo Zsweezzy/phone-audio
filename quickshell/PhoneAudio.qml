@@ -10,22 +10,24 @@
 //     PhoneAudio.on           is the loopback running
 //     PhoneAudio.phone        selected phone display name
 //     PhoneAudio.profile      active bluez profile
-//     PhoneAudio.volume       volume 0-100
+//     PhoneAudio.volume       volume 0-100 (-1 when unknown)
 //     PhoneAudio.reason       human note when something needs attention
 //     PhoneAudio.toggle()     flip the routing on/off
 
 pragma Singleton
 import QtQuick
+import Quickshell
 import Quickshell.Io
 
-QtObject {
+Singleton {
     id: root
 
     readonly property bool available: root._json.available === true
     readonly property bool on: root._json.on === true
     readonly property string phone: (root._json.phone && root._json.phone.name) || ""
     readonly property string profile: root._json.profile || ""
-    readonly property int volume: root._json.volume === null ? -1 : Math.round(root._json.volume)
+    readonly property int volume: typeof root._json.volume === "number"
+        ? Math.round(root._json.volume) : -1
     readonly property string reason: root._json.reason || ""
     readonly property string summary: {
         if (!root.available) return "no phone"
