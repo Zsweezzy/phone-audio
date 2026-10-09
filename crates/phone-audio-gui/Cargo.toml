@@ -1,0 +1,10 @@
+[package]
+name = "phone-audio-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phone Audio — small tray-style window to route a Bluetooth phone's audio to this PC"
+
+[dependencies]
+phone-audio-core = { path = "../phone-audio-core" }
+iced = { version = "0.14", features = ["tokio"] }

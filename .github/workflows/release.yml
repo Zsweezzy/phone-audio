@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist/bin dist/assets dist/quickshell
+          cp target/release/phone-audio target/release/phone-audio-gui dist/bin/
+          cp install.sh phone-audio.desktop dist/
+          cp assets/phone-audio.svg dist/assets/
+          cp quickshell/PhoneAudio.qml dist/quickshell/
+          tar -C dist -czf phone-audio-${{ github.ref_name }}.tar.gz .
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: phone-audio-*.tar.gz
+          generate_release_notes: true

@@ -1,0 +1,11 @@
+[package]
+name = "phone-audio-cli"
+version = "0.1.0"
+edition.workspace = true
+description = "Route a Bluetooth phone's audio to this PC via PipeWire — command line"
+license.workspace = true
+
+[dependencies]
+phone-audio-core = { path = "../phone-audio-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

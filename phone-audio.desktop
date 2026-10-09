@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Phone Audio
+Comment=Route a Bluetooth phone's audio to this PC via PipeWire
+Exec=phone-audio-gui
+Icon=phone-audio
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=bluetooth;phone;pipewire;audio;
