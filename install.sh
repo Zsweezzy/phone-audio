@@ -49,3 +49,4 @@ fi
 update-desktop-database "$share_dir/applications" 2>/dev/null || true
 
 echo "installed to $bin_dir (add it to PATH if needed); tray icon in $share_dir/applications"
+echo "quickshell shim: cp $here/quickshell/PhoneAudio.qml ~/.config/quickshell/<your-config>/ (then use PhoneAudio.* in QML)"

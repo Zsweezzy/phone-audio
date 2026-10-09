@@ -18,6 +18,7 @@ fn main() -> iced::Result {
 
 struct Gui {
     app: Option<App>,
+    startup_error: Option<String>,
     status: Status,
     phones: Vec<Phone>,
     combo: combo_box::State<String>,
@@ -38,8 +39,13 @@ enum Msg {
 
 impl Gui {
     fn new() -> Self {
+        let (app, startup_error) = match App::new() {
+            Ok(app) => (Some(app), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Self {
-            app: App::new().ok(),
+            app,
+            startup_error,
             status: Status::default(),
             phones: Vec::new(),
             combo: combo_box::State::new(Vec::new()),
@@ -105,22 +111,16 @@ impl Gui {
                         self.volume = v as f32;
                     }
                 }
+                self.phones = s.phones.clone(); // same scan status() already performed
                 self.status = s;
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
         }
-        match app.list_phones() {
-            Ok(phones) => {
-                let options: Vec<String> = phones.iter().map(|p| p.to_string()).collect();
-                // Rebuild only on an actual change so an open dropdown survives ticks.
-                if self.combo.options() != options.as_slice() {
-                    self.combo = combo_box::State::with_selection(options, self.selection.as_ref());
-                }
-                self.phones = phones;
-            }
-            Err(e) if self.error.is_none() => self.error = Some(e.to_string()),
-            Err(_) => {}
+        let options: Vec<String> = self.phones.iter().map(|p| p.to_string()).collect();
+        // Rebuild only on an actual change so an open dropdown survives ticks.
+        if self.combo.options() != options.as_slice() {
+            self.combo = combo_box::State::with_selection(options, self.selection.as_ref());
         }
     }
 
@@ -158,7 +158,7 @@ impl Gui {
         let mut col =
             column![picker, toggle_row, volume_row, text(status_text).size(12),].spacing(8);
 
-        if let Some(e) = &self.error {
+        if let Some(e) = self.error.as_ref().or(self.startup_error.as_ref()) {
             col = col.push(
                 text(e)
                     .size(11)

@@ -204,7 +204,10 @@ fn tmp_dir(name: &str) -> PathBuf {
 }
 
 fn seed_state_pid(state: &Path) -> u32 {
-    let pid = std::process::id(); // alive: /proc/<this test process> exists
+    // A pid that is *not* a live pw-loopback (identity check in pid_alive):
+    // this test process's /proc entry exists but its comm is not "pw-loopback",
+    // exactly the stale/zombie-pid situation fix 1 protects against.
+    let pid = std::process::id();
     std::fs::write(state, format!("{{\"loopback_pid\": {pid}}}")).unwrap();
     pid
 }
@@ -333,27 +336,43 @@ fn turn_on_switches_profile_then_loops_back_and_persists_pid() {
 }
 
 #[test]
-fn turn_on_skips_profile_switch_when_already_active_and_noops_if_running() {
+fn turn_on_restarts_when_stored_pid_is_not_a_live_loopback() {
     let dir = tmp_dir("turn-on-noop");
     let state = dir.join("state.json");
-    let _seed_pid = seed_state_pid(&state);
+    let _seed_pid = seed_state_pid(&state); // stale pid: not our loopback -> not alive
     let responses = vec![
         one_phone_dump("a2dp-source"), // discovery
         FakeRunner::ok(enum_profiles_text()),
         one_phone_dump("a2dp-source"), // poll
+        default_sink_out(),
     ];
     let fake = FakeRunner::new(responses);
     let log = fake.log();
-    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state, None);
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
     app.turn_on().unwrap();
 
     let calls = log.calls();
-    // No set-card-profile (already a2dp-source), no loopback spawn, no sink query.
+    // Profile already a2dp-source -> no set-card-profile; stale pid -> loopback respawned.
     assert!(!calls
         .iter()
         .any(|c| c[0] == "pactl" && c[1] == "set-card-profile"));
-    assert!(log.detached().is_empty());
-    assert_eq!(calls[2][0], "pw-dump");
+    assert_eq!(calls[3], ["pactl", "get-default-sink"]);
+    assert_eq!(
+        log.detached(),
+        vec![(
+            vec![
+                "pw-loopback".into(),
+                "-C".into(),
+                SOURCE_NODE.into(),
+                "-P".into(),
+                SINK.into()
+            ],
+            1000
+        )]
+    );
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(stored.loopback_pid, Some(1000));
 }
 
 #[test]
@@ -369,12 +388,11 @@ fn turn_on_errors_without_phone() {
 // ---- turn_off ------------------------------------------------------------
 
 #[test]
-fn turn_off_kills_loopback_clears_state_and_drops_profile() {
+fn turn_off_with_stale_pid_clears_state_and_drops_profile_without_killing() {
     let dir = tmp_dir("turn-off");
     let state = dir.join("state.json");
-    let seed_pid = seed_state_pid(&state);
+    let _seed_pid = seed_state_pid(&state); // stale pid: kill must be skipped
     let responses = vec![
-        FakeRunner::ok(""),            // kill
         one_phone_dump("a2dp-source"), // scan for phone
         FakeRunner::ok(""),            // pactl set-card-profile off
     ];
@@ -384,9 +402,12 @@ fn turn_off_kills_loopback_clears_state_and_drops_profile() {
     app.turn_off().unwrap();
 
     let calls = log.calls();
-    assert_eq!(calls[0], ["kill", &seed_pid.to_string()]);
-    assert_eq!(calls[1], ["pw-dump"]);
-    assert_eq!(calls[2], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
+    assert!(
+        !calls.iter().any(|c| c[0] == "kill"),
+        "no kill for a dead pid"
+    );
+    assert_eq!(calls[0], ["pw-dump"]);
+    assert_eq!(calls[1], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
     assert!(!state.exists(), "state.json removed");
 }
 

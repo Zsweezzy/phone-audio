@@ -32,6 +32,7 @@ jobs:
           mkdir -p dist/bin dist/assets dist/quickshell
           cp target/release/phone-audio target/release/phone-audio-gui dist/bin/
           cp install.sh phone-audio.desktop dist/
+          cp LICENSE README.md dist/
           cp assets/phone-audio.svg dist/assets/
           cp quickshell/PhoneAudio.qml dist/quickshell/
           tar -C dist -czf phone-audio-${{ github.ref_name }}.tar.gz .

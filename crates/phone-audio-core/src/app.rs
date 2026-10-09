@@ -38,6 +38,8 @@ pub struct Status {
     /// Volume 0..=100 as a percentage, None when no bluez source node exists yet.
     pub volume: Option<f64>,
     pub reason: String,
+    /// All connected phones, from the same scan as the rest of the status.
+    pub phones: Vec<Phone>,
 }
 
 const RECEIVE_PROFILES: [&str; 4] = [
@@ -142,10 +144,12 @@ impl App {
     /// Full status: phone, active profile, whether our loopback is running, volume.
     pub fn status(&mut self) -> Result<Status> {
         let scan = self.scan()?;
+        let phones: Vec<Phone> = scan.devices.iter().map(|d| d.phone.clone()).collect();
         if scan.devices.is_empty() {
             return Ok(Status {
                 available: false,
                 reason: NO_PHONE_REASON.into(),
+                phones,
                 ..Default::default()
             });
         }
@@ -158,6 +162,7 @@ impl App {
             return Ok(Status {
                 available: true,
                 reason,
+                phones,
                 ..Default::default()
             });
         };
@@ -193,6 +198,7 @@ impl App {
             profile,
             volume,
             reason,
+            phones,
         })
     }
 
@@ -251,8 +257,13 @@ impl App {
         }
         if let Ok(scan) = self.scan() {
             if let Some(dev) = self.pick_phone(&scan) {
-                // Ignore failure: switching to "off" when it already is off can be non-zero.
-                let _ = self.run(&["pactl", "set-card-profile", &dev.phone.device_name, "off"]);
+                // Non-fatal: switching to "off" when it already is off can be non-zero,
+                // but the user must know if the drop actually failed.
+                if let Err(e) =
+                    self.run(&["pactl", "set-card-profile", &dev.phone.device_name, "off"])
+                {
+                    eprintln!("phone-audio: warning: could not drop profile: {e}");
+                }
             }
         }
         Ok(())
@@ -291,14 +302,14 @@ impl App {
         Ok(())
     }
 
-    /// Persist a phone selection matched by MAC (exact) or name (case-insensitive).
+    /// Persist a phone selection matched by MAC or name (both case-insensitive).
     pub fn set_phone(&mut self, name_or_mac: &str) -> Result<Phone> {
         let phones = self.list_phones()?;
-        let needle = name_or_mac.to_lowercase();
+        let needle = name_or_mac.to_uppercase();
         let found = phones
             .iter()
-            .find(|p| p.mac == name_or_mac)
-            .or_else(|| phones.iter().find(|p| p.name.to_lowercase() == needle))
+            .find(|p| p.mac == needle)
+            .or_else(|| phones.iter().find(|p| p.name.to_uppercase() == needle))
             .cloned()
             .ok_or_else(|| {
                 AudioError::NotFound(format!("no bluetooth phone matches '{name_or_mac}'"))
@@ -556,14 +567,12 @@ fn config_dir() -> PathBuf {
     base.join("phone-audio")
 }
 
-/// Missing file -> None; unparseable file -> error.
+/// Missing or malformed file -> None (no selection; next set-phone rewrites it).
 fn load_config(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
-        Ok(s) => {
-            let cfg: ConfigFile = serde_json::from_str(&s)
-                .map_err(|e| AudioError::Config(format!("bad config.json: {e}")))?;
-            Ok(cfg.phone_mac)
-        }
+        Ok(s) => Ok(serde_json::from_str::<ConfigFile>(&s)
+            .ok()
+            .and_then(|c| c.phone_mac)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -579,12 +588,26 @@ fn load_pid(path: &Path) -> Option<u32> {
 
 /// Process-alive check; Linux-only per spec (`/proc/<pid>`).
 fn pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    // Identity: must actually be our loopback.
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    if comm.trim() != "pw-loopback" {
+        return false;
+    }
+    // /proc/<pid>/stat field 3 = process state char; 'Z' = zombie (exited, unreaped).
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(2).map(str::to_string))
+        .map(|st| st != "Z")
+        .unwrap_or(false)
 }
 
 fn find_source<'a>(scan: &'a Scan, mac: &str) -> Option<&'a BlueNode> {
     let prefix = format!("bluez_input.{}.", mac_underscored(mac));
-    scan.sources.iter().find(|n| n.name.starts_with(&prefix))
+    // Prefer the real bluez input node over its `.monitor` sibling.
+    scan.sources
+        .iter()
+        .filter(|n| n.name.starts_with(&prefix))
+        .min_by_key(|n| if n.name.ends_with(".monitor") { 1 } else { 0 })
 }
 
 #[cfg(test)]

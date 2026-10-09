@@ -17,25 +17,31 @@ pub struct Profile {
 /// profile blocks. Tolerant: only looks for the interesting lines.
 ///
 /// A new profile starts at a line containing both `Object:` and `Param:Profile`;
-/// within it, `Prop: key ...:index/name/available` lines are followed by
-/// `Int N` / `String "..."` / `Id N` value lines. `Audio/Source` appearing in
-/// the block marks the profile as source-capable.
+/// any other `Object:` line (a foreign block) closes the current profile so its
+/// props cannot leak into a neighboring one. Within a profile, `Prop: key
+/// ...:index/name/available` lines are followed by `Int N` / `String "..."` /
+/// `Id N` value lines. `Audio/Source` appearing in the block marks the profile
+/// as source-capable.
 pub fn parse_profiles(text: &str) -> Vec<Profile> {
     let mut out = Vec::new();
     let mut cur: Option<Profile> = None;
     let mut key: Option<&str> = None;
     for line in text.lines() {
         let t = line.trim();
-        if t.starts_with("Object:") && t.contains("Param:Profile") {
+        if t.starts_with("Object:") {
             if let Some(p) = cur.take() {
                 out.push(p);
             }
-            cur = Some(Profile {
-                index: 0,
-                name: String::new(),
-                available: false,
-                has_source: false,
-            });
+            cur = if t.contains("Param:Profile") {
+                Some(Profile {
+                    index: 0,
+                    name: String::new(),
+                    available: false,
+                    has_source: false,
+                })
+            } else {
+                None
+            };
             key = None;
             continue;
         }
@@ -241,6 +247,37 @@ mod tests {
         ));
         s.push_str(&obj(5, "handsfree", 0, &["Audio/Sink", "Audio/Source"]));
         s
+    }
+
+    /// A junk non-Profile `Object:` block (a param from a different enum, e.g.
+    /// `EnumParam`) carrying props that must not leak into a profile.
+    fn junk_obj() -> String {
+        String::from(
+            r#"  Object: size 96, type Spa:Pod:Object:Param:EnumParam (131082), id Spa:Enum:ParamId:EnumParam (2)
+    Prop: key Spa:Pod:Object:Param:EnumParam:index (1), flags 00000000
+      Int 7
+    Prop: key Spa:Pod:Object:Param:EnumParam:name (2), flags 00000000
+      String "bogus"
+"#,
+        )
+    }
+
+    #[test]
+    fn junk_object_block_between_profiles_leaks_nothing() {
+        let text = format!(
+            "{}{}{}",
+            obj(0, "off", 1, &["Audio/Sink"]),
+            junk_obj(),
+            obj(1, "a2dp-source", 2, &["Audio/Source"])
+        );
+        let ps = parse_profiles(&text);
+        assert_eq!(ps.len(), 2, "junk block contributes no profile");
+        assert_eq!(ps[0].index, 0);
+        assert_eq!(ps[0].name, "off");
+        assert!(!ps[0].has_source);
+        assert_eq!(ps[1].index, 1);
+        assert_eq!(ps[1].name, "a2dp-source");
+        assert!(ps[1].has_source);
     }
 
     #[test]
