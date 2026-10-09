@@ -30,6 +30,7 @@ impl Log {
 }
 
 /// Records argv and returns scripted responses; empty queue -> empty OK.
+#[derive(Clone)]
 struct FakeRunner {
     queue: VecDeque<CmdOut>,
     log: Log,
@@ -78,6 +79,10 @@ impl CmdRunner for FakeRunner {
             .unwrap()
             .push((args.iter().map(|s| s.to_string()).collect(), pid));
         Ok(pid)
+    }
+
+    fn box_clone(&self) -> Box<dyn CmdRunner> {
+        Box::new(self.clone())
     }
 }
 
@@ -260,6 +265,24 @@ fn list_phones_finds_maxii_from_dump() {
             device_name: DEVICE_NAME.into(),
             device_id: DEVICE_ID,
         }
+    );
+}
+
+#[test]
+fn status_reports_reconnect_hint_when_configured_phone_absent() {
+    // Configured MAC but no device in the scan (also the post-`off` state):
+    // the reason must point at the toggle flow, not at re-picking the phone.
+    let mut app = App::with_runner(
+        Box::new(FakeRunner::new(vec![dump_json(&[], &[alsa_sink()])])),
+        Some(MAC.into()),
+    );
+    let s = app.status().unwrap();
+    assert!(!s.available);
+    assert!(s.reason.contains("not connected"), "reason: {}", s.reason);
+    assert!(
+        s.reason.contains("run 'phone-audio on'"),
+        "reason: {}",
+        s.reason
     );
 }
 
@@ -555,6 +578,111 @@ fn turn_on_errors_without_phone() {
     assert!(err.to_string().contains("no bluetooth phone"));
 }
 
+#[test]
+fn turn_on_without_phone_or_config_makes_no_reconnect_attempt() {
+    // No device and no configured MAC: actionable error, and no
+    // disconnect/connect commands may be issued.
+    let fake = FakeRunner::new(vec![dump_json(&[], &[alsa_sink()])]);
+    let log = fake.log();
+    let mut app = App::with_runner(Box::new(fake), None);
+    let err = app.turn_on().unwrap_err();
+    assert!(err.to_string().contains("no bluetooth phone"));
+    assert!(
+        !log.calls().iter().any(|c| c[0] == "bluetoothctl"),
+        "no reconnect attempt without a configured phone"
+    );
+}
+
+#[test]
+fn turn_on_reconnects_configured_phone_when_absent() {
+    // Discovery finds nothing for the configured MAC -> bluetoothctl connect,
+    // then the card reappears -> normal profile flow proceeds; the reconnect
+    // happens before any profile work, and the loopback still routes.
+    let responses = vec![
+        dump_json(&[], &[alsa_sink()]),       // discovery: phone absent
+        FakeRunner::ok(""),                   // bluetoothctl connect
+        one_phone_dump("off"),                // wait_for_card poll finds the card
+        one_phone_dump("off"),                // re-scan after reconnect
+        FakeRunner::ok(enum_profiles_text()), // enum-params
+        FakeRunner::ok(""),                   // pactl set-card-profile a2dp-source
+        one_phone_dump("a2dp-source"),        // wait_for_source finds the node
+        default_sink_out(),
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let dir = tmp_dir("turn-on-reconnect");
+    let mut app = App::with_paths(
+        Box::new(fake),
+        dir.join("config.json"),
+        dir.join("state.json"),
+        Some(MAC.into()),
+    );
+    app.turn_on().unwrap();
+    let calls = log.calls();
+    assert_eq!(calls[0], ["pw-dump"]);
+    assert_eq!(calls[1], ["bluetoothctl", "connect", MAC]);
+    assert_eq!(calls[2], ["pw-dump"], "wait_for_card polls for the card");
+    assert_eq!(calls[3], ["pw-dump"], "re-scan after reconnect");
+    assert_eq!(
+        calls[5],
+        ["pactl", "set-card-profile", DEVICE_NAME, "a2dp-source"]
+    );
+    assert_eq!(
+        log.detached(),
+        vec![(
+            vec![
+                "pw-loopback".into(),
+                "-C".into(),
+                SOURCE_NODE.into(),
+                "-P".into(),
+                SINK.into()
+            ],
+            1000
+        )]
+    );
+}
+
+#[test]
+fn turn_on_polls_until_source_node_appears_without_consuming_full_budget() {
+    // The bluez_input node appears only on the third wait-for-source scan; the
+    // poll loop must find it (with the bounded 500 ms interval, not a 30 s
+    // sleep), then spawn the loopback.
+    let responses = vec![
+        one_phone_dump("off"), // discovery
+        FakeRunner::ok(enum_profiles_text()),
+        FakeRunner::ok(""), // pactl set-card-profile a2dp-source
+        dump_json(&[bluez_device("a2dp-source")], &[alsa_sink()]), // poll 1: no node
+        dump_json(&[bluez_device("a2dp-source")], &[alsa_sink()]), // poll 2: no node
+        one_phone_dump("a2dp-source"), // poll 3: node appears
+        default_sink_out(),
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let dir = tmp_dir("turn-on-poll");
+    let mut app = App::with_paths(
+        Box::new(fake),
+        dir.join("config.json"),
+        dir.join("state.json"),
+        None,
+    );
+    let start = std::time::Instant::now();
+    app.turn_on().unwrap();
+    // Bound: the ~30 s budget must not be consumed — a few 500 ms polls at most.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "wait must be bounded, took {:?}",
+        start.elapsed()
+    );
+    let calls = log.calls();
+    let dumps = calls.iter().filter(|c| c[0] == "pw-dump").count();
+    assert_eq!(dumps, 4, "discovery + 3 polls, then the loopback spawns");
+    assert_eq!(calls[3], ["pw-dump"]);
+    assert_eq!(calls[4], ["pw-dump"]);
+    assert_eq!(calls[5], ["pw-dump"]);
+    assert_eq!(calls[6], ["pactl", "get-default-sink"]);
+    assert_eq!(log.detached().len(), 1);
+}
+
 // ---- turn_off ------------------------------------------------------------
 
 #[test]
@@ -565,6 +693,7 @@ fn turn_off_with_stale_pid_clears_state_and_drops_profile_without_killing() {
     let responses = vec![
         one_phone_dump("a2dp-source"), // scan for phone
         FakeRunner::ok(""),            // pactl set-card-profile off
+        FakeRunner::ok(""),            // bluetoothctl disconnect
     ];
     let fake = FakeRunner::new(responses);
     let log = fake.log();
@@ -578,7 +707,81 @@ fn turn_off_with_stale_pid_clears_state_and_drops_profile_without_killing() {
     );
     assert_eq!(calls[0], ["pw-dump"]);
     assert_eq!(calls[1], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
+    assert_eq!(calls[2], ["bluetoothctl", "disconnect", MAC]);
     assert!(!state.exists(), "state.json removed");
+}
+
+#[test]
+fn turn_off_kills_live_loopback_drops_profile_and_disconnects() {
+    let dir = tmp_dir("turn-off-live");
+    let state = dir.join("state.json");
+    // A real process named pw-loopback so pid_alive() reports it live.
+    let exe = dir.join("pw-loopback");
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("no sleep binary to copy");
+    std::fs::copy(sleep, &exe).unwrap();
+    let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
+    for _ in 0..100 {
+        let ok = std::fs::read_to_string(format!("/proc/{}/comm", child.id()))
+            .map(|s| s.trim() == "pw-loopback")
+            .unwrap_or(false);
+        if ok {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::fs::write(&state, format!("{{\"loopback_pid\": {}}}", child.id())).unwrap();
+
+    // Responses follow the run() order: kill, scan, pactl off, disconnect.
+    let responses = vec![
+        FakeRunner::ok(""),            // kill (result unused by turn_off)
+        one_phone_dump("a2dp-source"), // scan
+        FakeRunner::ok(""),            // pactl set-card-profile off
+        FakeRunner::ok(""),            // bluetoothctl disconnect
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_off().unwrap();
+
+    let calls = log.calls();
+    assert_eq!(calls[0], ["kill", &child.id().to_string()]);
+    assert_eq!(calls[1], ["pw-dump"]);
+    assert_eq!(calls[2], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
+    assert_eq!(calls[3], ["bluetoothctl", "disconnect", MAC]);
+    assert!(!state.exists(), "state.json removed");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn turn_off_disconnects_configured_phone_when_card_already_gone() {
+    // The card vanished (e.g. a disconnect raced it away): the profile drop is
+    // skipped and the disconnect still goes out for the configured MAC, on a
+    // best-effort basis (a failed disconnect is tolerated, not an error).
+    let responses = vec![
+        dump_json(&[], &[alsa_sink()]), // scan: phone already gone
+        CmdOut {
+            status: 1,
+            stdout: String::new(),
+            stderr: "Device 28:8F:F6:71:6F:6E not available\n".into(),
+        },
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_runner(Box::new(fake), Some(MAC.into()));
+    app.turn_off().unwrap(); // tolerant: failure to disconnect is not fatal
+
+    let calls = log.calls();
+    assert_eq!(calls[0], ["pw-dump"]);
+    assert_eq!(calls[1], ["bluetoothctl", "disconnect", MAC]);
+    assert!(
+        !calls.iter().any(|c| c[0] == "pactl"),
+        "no profile drop for a missing card"
+    );
 }
 
 // ---- volume / set-phone / config -----------------------------------------

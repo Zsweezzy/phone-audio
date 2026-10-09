@@ -16,6 +16,9 @@ pub trait CmdRunner: Send {
     fn run(&mut self, args: &[&str]) -> Result<CmdOut>;
     /// Spawn a background process (stdio to /dev/null); returns its PID.
     fn run_detached(&mut self, args: &[&str]) -> Result<u32>;
+    /// A fresh boxed clone. Lets the GUI run a toggle on a detached copy of the
+    /// app (its runner is stateless; state that matters lives in files).
+    fn box_clone(&self) -> Box<dyn CmdRunner>;
 }
 
 /// Runs real processes via std.
@@ -46,5 +49,9 @@ impl CmdRunner for RealRunner {
             .stderr(Stdio::null());
         let child = cmd.spawn()?;
         Ok(child.id())
+    }
+
+    fn box_clone(&self) -> Box<dyn CmdRunner> {
+        Box::new(*self)
     }
 }

@@ -2287,6 +2287,7 @@ version = "0.1.0"
 dependencies = [
  "iced",
  "phone-audio-core",
+ "tokio",
 ]
 
 [[package]]

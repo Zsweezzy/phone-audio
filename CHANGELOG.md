@@ -8,6 +8,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `phone-audio-core`: `phone-audio on` now reconnects a configured phone with
+  `bluetoothctl connect` when it is absent (waiting up to ~15 s for its card),
+  waits up to ~30 s for the phone to actually stream (polling every 500 ms,
+  with a one-line "waiting for the phone to play" notice), and errors with an
+  actionable message instead of failing when no phone is configured at all.
+- `phone-audio-core`: `phone-audio off` now runs `bluetoothctl disconnect`
+  after killing the loopback and dropping the profile, so the phone plays on
+  its own speaker while staying paired; the profile drop and disconnect are
+  best-effort and tolerate the card vanishing mid-turn-off.
+- `phone-audio-core`: status reports "phone not connected — run 'phone-audio
+  on' to reconnect" when the configured phone is absent (including after
+  `off`), pointing at the toggle flow instead of re-selecting the phone.
 - `phone-audio-core`: read the active bluez profile from `bluez5.profile`
   (the key pw-dump actually emits), falling back to `api.bluez5.profile`.
 - `phone-audio-core`: pick a receive profile on real bluez cards, whose
@@ -25,16 +37,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   streaming; status reasons now distinguish "streaming — run 'phone-audio on'",
   "profile off — run 'phone-audio on'" and "not streaming — start playback on
   the phone".
+- `phone-audio-gui`: run the on/off toggle on a background thread via
+  `Task::perform` + `spawn_blocking` so the ~30 s wait no longer freezes the
+  window; the status poll keeps ticking and repeat toggles are ignored while
+  one is pending.
 
 ### Docs
 
-- `README.md`: document a live-verified iPhone quirk — after `phone-audio
-  off` iOS keeps its media session routed to the dropped Bluetooth path and
-  stays silent until the phone is picked as output (e.g. Control Center) or
-  playback restarts; this is the phone's media-stack behavior (no A2DP
-  transport remains on the PC side), the device stays paired, and re-running
-  `on` restores routing. Note in "How it works" that fallback to the phone's
-  own speaker depends on its media stack.
+- `README.md`: document the new on/off flow — `on` reconnects the phone if
+  needed and waits up to ~30 s for streaming before routing, while `off`
+  disconnects the phone so it plays on its own speaker (verified live on an
+  iPhone) with the pairing kept; the Control-Center workaround is now just a
+  footnote for phones that misbehave after `off`.
 
 ## [0.1.0] - 2026-10-09
 

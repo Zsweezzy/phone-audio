@@ -26,6 +26,8 @@ struct Gui {
     volume: f32,
     dragging: bool,
     error: Option<String>,
+    /// A toggle is running off the UI thread; ignore further toggles until it lands.
+    busy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,7 @@ enum Msg {
     Tick,
     PhonePicked(String),
     Toggle,
+    ToggleDone(std::result::Result<(), String>),
     VolumeChanged(f32),
     VolumeReleased,
 }
@@ -53,12 +56,16 @@ impl Gui {
             volume: 50.0,
             dragging: false,
             error: None,
+            busy: false,
         }
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
         match msg {
-            Msg::Tick => self.refresh(),
+            Msg::Tick => {
+                self.refresh();
+                Task::none()
+            }
             Msg::PhonePicked(label) => {
                 self.selection = Some(label.clone());
                 if let Some(app) = self.app.as_mut() {
@@ -70,24 +77,49 @@ impl Gui {
                     }
                 }
                 self.refresh();
+                Task::none()
             }
             Msg::Toggle => {
-                if let Some(app) = self.app.as_mut() {
-                    let r = if self.status.on {
-                        app.turn_off()
-                    } else {
-                        app.turn_on()
-                    };
-                    match r {
-                        Ok(()) => self.error = None,
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
+                // One toggle at a time; the wait can block ~30 s, so it runs
+                // off the UI thread on a clone of the app (state that matters
+                // lives in files, so the polling copy stays consistent).
+                if self.busy {
+                    return Task::none();
+                }
+                let Some(app) = self.app.clone() else {
+                    return Task::none();
+                };
+                self.busy = true;
+                let on = self.status.on;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let mut app = app;
+                            if on {
+                                app.turn_off().map_err(|e| e.to_string())
+                            } else {
+                                app.turn_on().map_err(|e| e.to_string())
+                            }
+                        })
+                        .await
+                        .expect("toggle worker panicked")
+                    },
+                    Msg::ToggleDone,
+                )
+            }
+            Msg::ToggleDone(result) => {
+                self.busy = false;
+                match result {
+                    Ok(()) => self.error = None,
+                    Err(e) => self.error = Some(e),
                 }
                 self.refresh();
+                Task::none()
             }
             Msg::VolumeChanged(v) => {
                 self.dragging = true;
                 self.volume = v;
+                Task::none()
             }
             Msg::VolumeReleased => {
                 self.dragging = false;
@@ -97,9 +129,9 @@ impl Gui {
                         Err(e) => self.error = Some(e.to_string()),
                     }
                 }
+                Task::none()
             }
         }
-        Task::none()
     }
 
     fn refresh(&mut self) {
@@ -134,7 +166,7 @@ impl Gui {
         .width(Length::Fill);
 
         let mut tgl = toggler(self.status.on).label("On main speakers");
-        if self.status.available {
+        if self.status.available && !self.busy {
             tgl = tgl.on_toggle(|_| Msg::Toggle);
         }
         let profile = self.status.profile.as_deref().unwrap_or("-");

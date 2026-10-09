@@ -45,6 +45,20 @@ pub struct Status {
 const NO_PHONE_REASON: &str =
     "no bluetooth phone connected (pair first; bluetoothctl paired-devices)";
 const MULTI_PHONE_REASON: &str = "multiple phones — pick one with 'phone-audio set-phone'";
+/// Shown when a configured phone is absent from the scan (also post-`off`).
+const RECONNECT_REASON: &str = "phone not connected — run 'phone-audio on' to reconnect";
+
+/// Poll interval while waiting for a phone card / streaming source node.
+const SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// `turn_on` waits up to this long for the phone to actually stream.
+const WAIT_FOR_SOURCE_SECS: u64 = 30;
+/// `turn_on` waits up to this long for a reconnected phone's card to appear.
+const WAIT_FOR_CARD_SECS: u64 = 15;
+
+/// Polls at [`SOURCE_POLL_INTERVAL`] that fit into `total_secs`.
+fn poll_count(total_secs: u64) -> u64 {
+    total_secs * 1000 / SOURCE_POLL_INTERVAL.as_millis() as u64
+}
 
 /// A bluez card with its active profile.
 #[derive(Debug, Clone)]
@@ -86,6 +100,17 @@ pub struct App {
     cfg_path: PathBuf,
     state_path: PathBuf,
     phone_mac: Option<String>,
+}
+
+impl Clone for App {
+    fn clone(&self) -> Self {
+        Self {
+            runner: self.runner.box_clone(),
+            cfg_path: self.cfg_path.clone(),
+            state_path: self.state_path.clone(),
+            phone_mac: self.phone_mac.clone(),
+        }
+    }
 }
 
 impl App {
@@ -141,20 +166,25 @@ impl App {
         if scan.devices.is_empty() {
             return Ok(Status {
                 available: false,
-                reason: NO_PHONE_REASON.into(),
+                reason: if self.phone_mac.is_some() {
+                    RECONNECT_REASON
+                } else {
+                    NO_PHONE_REASON
+                }
+                .into(),
                 phones,
                 ..Default::default()
             });
         }
         let Some(dev) = self.pick_phone(&scan) else {
             let reason = if self.phone_mac.is_some() {
-                "configured phone not connected (run 'phone-audio set-phone' again)".into()
+                RECONNECT_REASON
             } else {
-                MULTI_PHONE_REASON.into()
+                MULTI_PHONE_REASON
             };
             return Ok(Status {
                 available: true,
-                reason,
+                reason: reason.into(),
                 phones,
                 ..Default::default()
             });
@@ -197,7 +227,30 @@ impl App {
 
     /// Switch to a receive profile, wait for the bluez input node, run the loopback.
     pub fn turn_on(&mut self) -> Result<()> {
-        let scan = self.scan()?;
+        let mut scan = self.scan()?;
+        if self.pick_phone(&scan).is_none() {
+            match self.phone_mac.clone() {
+                Some(mac) => {
+                    // The configured phone is absent: reconnect it, then wait
+                    // for its card to come back into the scan.
+                    self.run(&["bluetoothctl", "connect", &mac])?;
+                    self.wait_for_card(&mac)?;
+                    scan = self.scan()?;
+                }
+                None => {
+                    // No configured phone: nothing to reconnect to. In a
+                    // single-phone setup with nothing connected, stop here with
+                    // an actionable error instead of guessing a MAC.
+                    let msg = if scan.devices.is_empty() {
+                        "no bluetooth phone connected — pair it first, then run 'phone-audio on'"
+                            .to_string()
+                    } else {
+                        MULTI_PHONE_REASON.to_string()
+                    };
+                    return Err(AudioError::NotFound(msg));
+                }
+            }
+        }
         let Some(dev) = self.pick_phone(&scan) else {
             return Err(AudioError::NotFound("no bluetooth phone connected".into()));
         };
@@ -240,7 +293,8 @@ impl App {
         self.save_state_pid(pid)
     }
 
-    /// Kill our loopback and drop the profile so the phone plays on its own speaker.
+    /// Kill our loopback, drop the profile, and disconnect the phone so it
+    /// plays on its own speaker (pairing is kept).
     pub fn turn_off(&mut self) -> Result<()> {
         if let Some(pid) = load_pid(&self.state_path) {
             if pid_alive(pid) {
@@ -248,15 +302,25 @@ impl App {
             }
             self.clear_state()?;
         }
-        if let Ok(scan) = self.scan() {
-            if let Some(dev) = self.pick_phone(&scan) {
-                // Non-fatal: switching to "off" when it already is off can be non-zero,
-                // but the user must know if the drop actually failed.
-                if let Err(e) =
-                    self.run(&["pactl", "set-card-profile", &dev.phone.device_name, "off"])
-                {
-                    eprintln!("phone-audio: warning: could not drop profile: {e}");
-                }
+        // Best-effort profile drop: the card can vanish mid-turn-off (the
+        // disconnect below races it away), so a missing device is not an error.
+        let scanned_mac = self.scan().ok().and_then(|scan| {
+            let dev = self.pick_phone(&scan)?;
+            // Non-fatal: switching to "off" when it already is off can be non-zero,
+            // but the user must know if the drop actually failed.
+            if let Err(e) = self.run(&["pactl", "set-card-profile", &dev.phone.device_name, "off"])
+            {
+                eprintln!("phone-audio: warning: could not drop profile: {e}");
+            }
+            Some(dev.phone.mac.clone())
+        });
+        // Disconnect so the phone's media falls back to its own speaker. The
+        // MAC comes from config or the (now possibly gone) scan; tolerating a
+        // failed disconnect keeps this best-effort when the device vanished.
+        let mac = self.phone_mac.clone().or(scanned_mac);
+        if let Some(mac) = mac {
+            if let Err(e) = self.run(&["bluetoothctl", "disconnect", &mac]) {
+                eprintln!("phone-audio: warning: could not disconnect {mac}: {e}");
             }
         }
         Ok(())
@@ -478,15 +542,38 @@ impl App {
         }
     }
 
-    /// Poll `pw-dump` up to ~2.5s for the `bluez_input.<mac>.*` source node.
+    /// Poll `pw-dump` up to [`WAIT_FOR_CARD_SECS`] for the configured phone's card.
+    fn wait_for_card(&mut self, mac: &str) -> Result<()> {
+        let polls = poll_count(WAIT_FOR_CARD_SECS);
+        for i in 0..polls {
+            let scan = self.scan()?;
+            if scan.devices.iter().any(|d| d.phone.mac == *mac) {
+                return Ok(());
+            }
+            if i + 1 < polls {
+                std::thread::sleep(SOURCE_POLL_INTERVAL);
+            }
+        }
+        Err(AudioError::NotFound(format!(
+            "could not reconnect {mac} after {WAIT_FOR_CARD_SECS} s — is it powered on and in range?"
+        )))
+    }
+
+    /// Poll `pw-dump` up to [`WAIT_FOR_SOURCE_SECS`] for the
+    /// `bluez_input.<mac>.*` source node, announcing the wait once when it
+    /// actually has to block on the phone starting to stream.
     fn wait_for_source(&mut self, mac: &str) -> Result<Option<String>> {
-        for i in 0..13 {
+        let polls = poll_count(WAIT_FOR_SOURCE_SECS);
+        for i in 0..polls {
             let scan = self.scan()?;
             if let Some(node) = find_source(&scan, mac) {
                 return Ok(Some(node.name.clone()));
             }
-            if i < 12 {
-                std::thread::sleep(Duration::from_millis(200));
+            if i == 0 {
+                eprintln!("waiting for the phone to play (up to {WAIT_FOR_SOURCE_SECS} s)…");
+            }
+            if i + 1 < polls {
+                std::thread::sleep(SOURCE_POLL_INTERVAL);
             }
         }
         Ok(None)

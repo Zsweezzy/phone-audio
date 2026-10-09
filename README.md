@@ -35,8 +35,8 @@ WirePlumber). The GUI additionally needs a Wayland/X11 session.
 ## Usage
 
 ```
-phone-audio on          # switch phone to a2dp-source and start the loopback
-phone-audio off         # stop the loopback and drop the profile (phone plays again)
+phone-audio on          # reconnect the phone if needed, switch to a2dp-source, start the loopback
+phone-audio off         # stop the loopback and disconnect the phone (it plays on its own speaker; pairing kept)
 phone-audio status      # phone, profile, on/off, volume
 phone-audio status --json
 phone-audio list        # connected bluetooth phones
@@ -55,21 +55,24 @@ State and selection live in `~/.config/phone-audio/{config,state}.json`.
 
 ## How it works
 
-1. `pw-dump` finds the connected `bluez5` card and its active profile.
+1. `pw-dump` finds the connected `bluez5` card and its active profile. If the
+   configured phone is absent, `bluetoothctl connect <mac>` reconnects it and
+   `on` waits (up to ~15 s) for the card to reappear; with no configured phone
+   it stops with an error instead of guessing a MAC.
 2. `pw-cli enum-params <id> EnumProfile` lists profiles; the first available
    one that *captures* phone audio wins: `a2dp-source` → `a2dp-duplex` →
    `audio-gateway` → any available profile exposing an `Audio/Source` class or
    a known receive profile name (bluez cards don't emit class structs).
 3. `pactl set-card-profile` switches to it (skipped if already active).
-4. It waits (up to ~2.5 s) for the `bluez_input.<mac>.*` source node, then
+4. It waits (up to ~30 s) for the `bluez_input.<mac>.*` source node, then
    starts `pw-loopback` from it to the default sink in the background and
    records the PID. This node only appears while the phone actually streams,
-   so run `on` while/after playback starts — it waits ~2.5 s — or press play
-   on the phone first, then run `on`.
-5. `turn_off` kills that PID and sets the profile back to `off` — whether the
-   phone then falls back to its own speaker depends on the phone's media
-   stack (iOS may keep the session silent until you pick the phone as
-   output, see Troubleshooting).
+   so start playback on the phone if `on` times out — it polls every 500 ms
+   and can be run again once playback is going.
+5. `turn_off` kills that PID, drops the profile, then runs
+   `bluetoothctl disconnect` — the phone falls back to its own speaker
+   immediately (verified on an iPhone) and stays paired; `on` reconnects it
+   automatically.
 
 Only one abstraction is allowed out of the core: every external command goes
 through `CmdRunner`. That is what makes the whole app testable without a
@@ -107,14 +110,13 @@ Button { onClicked: PhoneAudio.toggle() }
 - While streaming, the card's `bluez5.profile` may still read `off` — that is
   normal idle BlueZ state. `status` reports `on: true` from the live loopback
   plus the present source node, not from the profile.
-- After `phone-audio off` the phone may stay silent: iOS keeps its audio
-  routed to the (now dropped) Bluetooth path and does not fall back to its
-  own speaker until you pick the phone as output in the phone's audio picker
-  (e.g. Control Center) or restart playback. This is the phone's media stack,
-  not the PC — no A2DP transport exists on the PC side while off (check
-  `pw-dump`). The device stays paired: run `phone-audio on` again with
-  playback started or starting and routing is restored. Many Android phones
-  resume on their own speaker immediately and need none of this.
+- After `phone-audio off`, the phone is disconnected (via `bluetoothctl
+  disconnect`) so its audio falls back to its own speaker; the pairing is
+  kept. This fallback was verified live on an iPhone (audio moves back
+  immediately) and works on Android phones too. `phone-audio on` reconnects
+  automatically and waits for streaming. If a phone still misbehaves after
+  `off`, pick it as the output device on the phone itself (e.g. Control
+  Center) and restart playback.
 - `phone-audio status --json` is the machine-readable surface for scripting
   and panels.
 
