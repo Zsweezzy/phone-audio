@@ -208,10 +208,11 @@ impl Gui {
         } else {
             MUTED
         };
-        let (pill_text, pill_color, pill_bg) = if self.status.on {
-            ("routing to PC", GREEN, GREEN_TINT)
-        } else if self.busy {
+        let (pill_text, pill_color, pill_bg) = if self.busy {
+            // An in-flight turn-off outlives status.on by up to ~30 s; busy wins.
             ("working…", CYAN, CYAN_TINT)
+        } else if self.status.on {
+            ("routing to PC", GREEN, GREEN_TINT)
         } else {
             ("off", MUTED, CARD_BG)
         };
@@ -274,7 +275,7 @@ impl Gui {
 
 // --- Tokyonight-night palette -------------------------------------------------
 const FG: Color = Color::from_rgba8(0xc0, 0xca, 0xf5, 1.0);
-const MUTED: Color = Color::from_rgba8(0x56, 0x5f, 0x89, 1.0);
+const MUTED: Color = Color::from_rgba8(0x73, 0x7a, 0xa2, 1.0);
 const CARD_BG: Color = Color::from_rgba8(0x29, 0x2e, 0x42, 1.0);
 const BORDER: Color = Color::from_rgba8(0x3b, 0x42, 0x61, 1.0);
 const CHIP_BG: Color = Color::from_rgba8(0x1f, 0x23, 0x35, 1.0);
