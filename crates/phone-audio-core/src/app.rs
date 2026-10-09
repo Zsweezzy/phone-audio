@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::cmd::{CmdOut, CmdRunner, RealRunner};
 use crate::pw::{
     mac_underscored, obj_id, obj_type, parse_profiles, parse_volume, pick_receive_profile, props,
+    RECEIVE_PROFILES,
 };
 use crate::{AudioError, Result};
 
@@ -41,13 +42,6 @@ pub struct Status {
     /// All connected phones, from the same scan as the rest of the status.
     pub phones: Vec<Phone>,
 }
-
-const RECEIVE_PROFILES: [&str; 4] = [
-    "a2dp-source",
-    "a2dp-duplex",
-    "headset-head-unit",
-    "headset-audio-gateway",
-];
 
 const NO_PHONE_REASON: &str =
     "no bluetooth phone connected (pair first; bluetoothctl paired-devices)";
@@ -436,8 +430,9 @@ impl App {
                         .unwrap_or(&device_name)
                         .to_string();
                     let profile = p
-                        .get("api.bluez5.profile")
+                        .get("bluez5.profile")
                         .and_then(|x| x.as_str())
+                        .or_else(|| p.get("api.bluez5.profile").and_then(|x| x.as_str()))
                         .map(String::from);
                     let phone = Phone {
                         mac: mac.to_string(),

@@ -11,10 +11,12 @@ use crate::Result;
 
 /// Call log shared between tests and the boxed runner: the runner is `Send`,
 /// but the log lives on `Arc<Mutex>` so tests can read it back after boxing.
+type Detached = Vec<(Vec<String>, u32)>;
+
 #[derive(Clone, Default)]
 struct Log {
     calls: Arc<Mutex<Vec<Vec<String>>>>,
-    detached: Arc<Mutex<Vec<(Vec<String>, u32)>>>,
+    detached: Arc<Mutex<Detached>>,
 }
 
 impl Log {
@@ -196,6 +198,30 @@ fn enum_profiles_text() -> &'static str {
 "#
 }
 
+/// The real bluez card (PipeWire 1.6.9 / WirePlumber 0.5.18): only `off` and
+/// `audio-gateway`, with NO `classes` struct in either block.
+fn enum_classless_text() -> &'static str {
+    r#"  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int 0
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "off"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "Off"
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id 2        (Spa:Enum:ParamAvailability:yes)
+  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int 1
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "audio-gateway"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "Audio Gateway (A2DP Source & HSP/HFP AG)"
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id 2        (Spa:Enum:ParamAvailability:yes)
+"#
+}
+
 fn tmp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("pa-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -280,6 +306,21 @@ fn status_with_single_phone_reports_profile_and_volume() {
     assert_eq!(s.volume, Some(65.0));
 }
 
+#[test]
+fn status_prefers_bluez5_profile_key_over_api_fallback() {
+    // Real pw-dump emits `bluez5.profile` (not `api.bluez5.profile`); when both
+    // keys are present the unprefixed one wins.
+    let mut dev = bluez_device("off");
+    dev["info"]["props"]["bluez5.profile"] = serde_json::json!("audio-gateway");
+    let fake = FakeRunner::new(vec![
+        dump_json(&[dev], &[source_node(), alsa_sink()]),
+        FakeRunner::ok("Volume: 0.5\n"),
+    ]);
+    let mut app = App::with_runner(Box::new(fake), None);
+    let s = app.status().unwrap();
+    assert_eq!(s.profile.as_deref(), Some("audio-gateway"));
+}
+
 // ---- turn_on -------------------------------------------------------------
 
 #[test]
@@ -333,6 +374,45 @@ fn turn_on_switches_profile_then_loops_back_and_persists_pid() {
     let stored: StateFile =
         serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
     assert_eq!(stored.loopback_pid, Some(1000));
+}
+
+#[test]
+fn turn_on_picks_audio_gateway_on_classless_bluez_card() {
+    // Real bluez cards list only off + audio-gateway and expose no classes
+    // struct; the app must still pick a receive profile by name.
+    let dir = tmp_dir("turn-on-gateway");
+    let cfg = dir.join("config.json");
+    let state = dir.join("state.json");
+    let responses = vec![
+        one_phone_dump("off"),                 // phone discovery
+        FakeRunner::ok(enum_classless_text()), // off + audio-gateway, classless
+        FakeRunner::ok(""),                    // pactl set-card-profile audio-gateway
+        one_phone_dump("audio-gateway"),       // poll finds bluez_input node
+        default_sink_out(),
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), cfg.clone(), state.clone(), None);
+    app.turn_on().unwrap();
+
+    let calls = log.calls();
+    assert_eq!(
+        calls[2],
+        ["pactl", "set-card-profile", DEVICE_NAME, "audio-gateway"]
+    );
+    assert_eq!(
+        log.detached(),
+        vec![(
+            vec![
+                "pw-loopback".into(),
+                "-C".into(),
+                SOURCE_NODE.into(),
+                "-P".into(),
+                SINK.into()
+            ],
+            1000
+        )]
+    );
 }
 
 #[test]

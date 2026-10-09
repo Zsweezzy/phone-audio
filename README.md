@@ -49,12 +49,17 @@ phone-audio-gui         # small window with phone picker, toggle and volume
 
 State and selection live in `~/.config/phone-audio/{config,state}.json`.
 
+> **GUI + MangoHUD**: if `MANGOHUD=1` is set session-wide, launch the GUI with
+> `env -u MANGOHUD phone-audio-gui` so the overlay doesn't cover the window
+> (the desktop entry already does this).
+
 ## How it works
 
 1. `pw-dump` finds the connected `bluez5` card and its active profile.
 2. `pw-cli enum-params <id> EnumProfile` lists profiles; the first available
-   one that *captures* phone audio wins: `a2dp-source` → `a2dp-duplex` → any
-   available profile exposing an `Audio/Source`.
+   one that *captures* phone audio wins: `a2dp-source` → `a2dp-duplex` →
+   `audio-gateway` → any available profile exposing an `Audio/Source` class or
+   a known receive profile name (bluez cards don't emit class structs).
 3. `pactl set-card-profile` switches to it (skipped if already active).
 4. It waits (up to ~2.5 s) for the `bluez_input.<mac>.1` source node, then
    starts `pw-loopback` from it to the default sink in the background and
@@ -85,10 +90,10 @@ Button { onClicked: PhoneAudio.toggle() }
 
 - Run `phone-audio debug` first — it dumps phones, nodes, profiles and the
   loopback state in one place.
-- If no `a2dp-source` profile is listed, inspect
+- If no receive profile is listed, inspect
   `pw-cli enum-params <device-id> EnumProfile` and make sure the WirePlumber
   bluetooth role config includes `a2dp_source` in `bluez5.roles` (the
-  `api.bluez5.profile` of the card must be switchable to it).
+  `bluez5.profile` of the card must be switchable to it).
 - After `phone-audio on`, the `bluez_input.<mac>.*` source node only appears
   once the phone actually streams — if nothing happens, start playback on the
   phone (the status line repeats this as "not streaming — start playback on

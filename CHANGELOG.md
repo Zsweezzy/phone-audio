@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `phone-audio-core`: read the active bluez profile from `bluez5.profile`
+  (the key pw-dump actually emits), falling back to `api.bluez5.profile`.
+- `phone-audio-core`: pick a receive profile on real bluez cards, whose
+  `EnumProfile` blocks carry no `classes` struct — profiles are now also
+  recognized by name (`audio-gateway`, `handsfree`, ...); `phone-audio on`
+  works on a card that only offers `off` + `audio-gateway`.
+- `phone-audio.desktop`: launch the GUI with `env -u MANGOHUD` so the overlay
+  doesn't cover the window when `MANGOHUD=1` is set session-wide.
+
 ## [0.1.0] - 2026-10-09
 
 Initial release.

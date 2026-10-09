@@ -13,6 +13,20 @@ pub struct Profile {
     pub has_source: bool,
 }
 
+/// Profile names that receive phone (remote) audio. Bluez cards emit
+/// class-less `EnumProfile` blocks (PipeWire 1.6.x), so a profile is also
+/// receive-capable when its name is in this list — not just when it exposes an
+/// `Audio/Source` class. Single source of truth; also used by the app's
+/// status/on check.
+pub const RECEIVE_PROFILES: [&str; 6] = [
+    "a2dp-source",
+    "a2dp-duplex",
+    "audio-gateway",
+    "headset-head-unit",
+    "headset-audio-gateway",
+    "handsfree",
+];
+
 /// Parse `pw-cli enum-params ... EnumProfile` text (the pod-dump format) into
 /// profile blocks. Tolerant: only looks for the interesting lines.
 ///
@@ -87,23 +101,20 @@ pub fn parse_profiles(text: &str) -> Vec<Profile> {
 }
 
 /// Pick the profile that receives phone (remote) audio:
-/// available `a2dp-source`, else `a2dp-duplex`, else any available profile exposing an
-/// Audio/Source class, preferring `a2dp`-named ones over `headset`.
+/// available `a2dp-source`, else `a2dp-duplex`, else `audio-gateway`, else any
+/// available source-capable profile (Audio/Source class **or** name in
+/// [`RECEIVE_PROFILES`]), preferring `a2dp`-named ones over the first capable.
 pub fn pick_receive_profile(profiles: &[Profile]) -> Option<&Profile> {
     let named = |name: &str| profiles.iter().find(|p| p.available && p.name == name);
+    let capable: Vec<&Profile> = profiles
+        .iter()
+        .filter(|p| p.available && (p.has_source || RECEIVE_PROFILES.contains(&p.name.as_str())))
+        .collect();
     named("a2dp-source")
         .or_else(|| named("a2dp-duplex"))
-        .or_else(|| {
-            let with_source: Vec<&Profile> = profiles
-                .iter()
-                .filter(|p| p.available && p.has_source)
-                .collect();
-            with_source
-                .iter()
-                .find(|p| p.name.contains("a2dp"))
-                .copied()
-                .or_else(|| with_source.first().copied())
-        })
+        .or_else(|| named("audio-gateway"))
+        .or_else(|| capable.iter().find(|p| p.name.contains("a2dp")).copied())
+        .or_else(|| capable.first().copied())
 }
 
 /// Extract the volume float from `wpctl get-volume` output (e.g. `Volume: 0.65`).
@@ -312,7 +323,9 @@ mod tests {
         let duplex = make("a2dp-duplex", true, true);
         let headset = make("headset-head-unit", true, true);
         assert_eq!(
-            pick_receive_profile(&[duplex.clone()]).unwrap().name,
+            pick_receive_profile(std::slice::from_ref(&duplex))
+                .unwrap()
+                .name,
             "a2dp-duplex"
         );
         // a2dp preferred over headset among generic Audio/Source profiles
@@ -330,6 +343,107 @@ mod tests {
         );
         // no source-capable profile at all
         assert!(pick_receive_profile(&[make("off", true, false)]).is_none());
+    }
+
+    /// A bluez card profile block with NO `classes` struct at all — the real
+    /// shape of `pw-cli enum-params <bluez-id> EnumProfile` (PipeWire 1.6.9).
+    fn obj_classless(index: u32, name: &str, description: &str, id: u32) -> String {
+        let yes = if id == 2 { "yes" } else { "no" };
+        format!(
+            r#"  Object: size 160, type Spa:Pod:Object:Param:Profile (262151), id Spa:Enum:ParamId:EnumProfile (8)
+    Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+      Int {index}
+    Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+      String "{name}"
+    Prop: key Spa:Pod:Object:Param:Profile:description (3), flags 00000000
+      String "{description}"
+    Prop: key Spa:Pod:Object:Param:Profile:available (5), flags 00000000
+      Id {id}        (Spa:Enum:ParamAvailability:{yes})
+"#
+        )
+    }
+
+    #[test]
+    fn classless_bluez_profiles_are_source_capable_by_name() {
+        // The real bluez card: only `off` and `audio-gateway`, nothing in a
+        // `classes` struct, so no `Audio/Source` class string is present.
+        let text = obj_classless(0, "off", "Off", 2)
+            + &obj_classless(
+                1,
+                "audio-gateway",
+                "Audio Gateway (A2DP Source & HSP/HFP AG)",
+                2,
+            );
+        let ps = parse_profiles(&text);
+        assert_eq!(ps.len(), 2);
+        for p in &ps {
+            assert!(p.available, "both profiles available on a live card");
+            assert!(!p.has_source, "classless: no Audio/Source class string");
+        }
+        assert_eq!(
+            pick_receive_profile(&ps).unwrap().name,
+            "audio-gateway",
+            "name-based capability picks audio-gateway on a classless card"
+        );
+    }
+
+    #[test]
+    fn pick_treats_named_but_classless_headset_as_capable() {
+        // A profile whose name marks it capable is picked even without an
+        // Audio/Source class (classless bluez EnumProfile blocks).
+        for name in ["handsfree", "headset-head-unit", "headset-audio-gateway"] {
+            let p = make(name, true, false);
+            assert_eq!(
+                pick_receive_profile(&[p]).unwrap().name,
+                name,
+                "{name} is a receive profile by name"
+            );
+        }
+        // An unknown classless profile is not receive-capable.
+        assert!(pick_receive_profile(&[make("bogus", true, false)]).is_none());
+        assert!(pick_receive_profile(&[make("off", true, false)]).is_none());
+        // audio-gateway beats a classless headset when both are available.
+        let ps = [
+            make("handsfree", true, false),
+            make("audio-gateway", true, false),
+        ];
+        assert_eq!(pick_receive_profile(&ps).unwrap().name, "audio-gateway");
+    }
+
+    #[test]
+    fn pick_prefers_named_profiles_in_order() {
+        // a2dp-source -> a2dp-duplex -> audio-gateway -> first capable.
+        let ps = [
+            make("audio-gateway", true, false),
+            make("a2dp-duplex", true, false),
+            make("a2dp-source", true, false),
+        ];
+        assert_eq!(pick_receive_profile(&ps).unwrap().name, "a2dp-source");
+        let ps = [
+            make("audio-gateway", true, false),
+            make("a2dp-duplex", true, false),
+        ];
+        assert_eq!(pick_receive_profile(&ps).unwrap().name, "a2dp-duplex");
+        // Unavailable named profile is skipped; falls through to first capable.
+        let ps = [
+            make("a2dp-source", false, true),
+            make("handsfree", true, false),
+        ];
+        assert_eq!(pick_receive_profile(&ps).unwrap().name, "handsfree");
+    }
+
+    #[test]
+    fn receive_profiles_list_covers_all_receive_names() {
+        for name in [
+            "a2dp-source",
+            "a2dp-duplex",
+            "audio-gateway",
+            "headset-head-unit",
+            "headset-audio-gateway",
+            "handsfree",
+        ] {
+            assert!(RECEIVE_PROFILES.contains(&name), "{name} missing");
+        }
     }
 
     fn make(name: &str, available: bool, has_source: bool) -> Profile {
