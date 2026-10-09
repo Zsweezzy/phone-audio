@@ -41,6 +41,8 @@ enum Command {
     Off,
     /// Toggle on/off
     Toggle,
+    /// Forget a remembered phone (stale last_seen) — status then reports no phone
+    Forget,
     /// Set volume 0-100 percent
     Volume {
         #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
@@ -100,6 +102,10 @@ fn run(cmd: Command) -> phone_audio_core::Result<()> {
         Command::Toggle => {
             let on = app.toggle()?;
             println!("{}", if on { "on" } else { "off" });
+        }
+        Command::Forget => {
+            app.forget()?;
+            println!("Forgot remembered phone");
         }
         Command::Volume { percent } => app.set_volume(f64::from(percent))?,
         Command::Debug => print!("{}", app.debug()?),

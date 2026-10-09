@@ -194,6 +194,7 @@ impl App {
             if let Some(known) = self.known_phone() {
                 return Ok(Status {
                     available: true,
+                    phone: Some(known.clone()),
                     phones: vec![known],
                     reason: RECONNECT_REASON.into(),
                     ..Default::default()
@@ -209,13 +210,15 @@ impl App {
         // Remember the phone we'd pick (or the first one for an unconfigured
         // multi-phone scan) so `off` and a later reconnect still know it once
         // the card is gone. Best-effort: state is disposable and a read-only
-        // config dir must not break status.
+        // config dir must not break status. Only rewritten when the remembered
+        // phone actually changed — the GUI polls status every second and a
+        // no-op rewrite would race the toggle worker's pid write for nothing.
         if let Some(p) = self
             .pick_phone(&scan)
             .or_else(|| scan.devices.first())
             .map(|d| &d.phone)
         {
-            let _ = self.save_last_seen(p);
+            let _ = self.save_last_seen_if_changed(p);
         }
         let Some(dev) = self.pick_phone(&scan) else {
             let reason = if self.phone_mac.is_some() {
@@ -363,7 +366,12 @@ impl App {
                     }
                 }
             }
-            self.clear_state()?;
+            self.clear_state().unwrap_or_else(|e| {
+                // W2: state is disposable and must never stop `off` from
+                // actually disconnecting (a read-only state dir must not keep
+                // the phone streaming). Warn and carry on.
+                eprintln!("phone-audio: warning: could not clear state: {e}");
+            });
         }
         // Best-effort profile drop: the card can vanish mid-turn-off (the
         // disconnect below races it away), so a missing device is not an error.
@@ -398,6 +406,14 @@ impl App {
             self.turn_on()?;
         }
         Ok(!on)
+    }
+
+    /// Drop the remembered phone (`last_seen`) from state, keeping the loopback
+    /// pid untouched: after a phone is unpaired, a stale last_seen would keep
+    /// reporting it as available forever. While off (no live loopback), status
+    /// then reports no phone again until the next time it is seen.
+    pub fn forget(&mut self) -> Result<()> {
+        self.save_state(|s| s.last_seen = None)
     }
 
     /// Set volume 0..=100 on the phone's bluez Audio/Source node.
@@ -473,10 +489,14 @@ impl App {
         }
         let pid = load_pid(&self.state_path);
         o.push_str(&format!(
-            "state: loopback_pid={} alive={}\n",
+            "state: loopback_pid={} alive={} last_seen={}\n",
             pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-            pid.is_some_and(pid_alive)
+            pid.is_some_and(pid_alive),
+            load_last_seen(&self.state_path)
+                .map(|l| l.mac)
+                .unwrap_or_else(|| "-".into())
         ));
+        o.push_str("(stale last_seen keeps a phone reported as available; clear it with 'phone-audio forget')\n");
         if let Some(dev) = self.pick_phone(&scan) {
             match self.run(&[
                 "pw-cli",
@@ -712,6 +732,25 @@ impl App {
         })
     }
 
+    /// Like [`Self::save_last_seen`], but skips the write when the stored
+    /// record already matches: `status()` is polled once a second and must not
+    /// rewrite state.json on every poll (a no-op rewrite would race the toggle
+    /// worker's own rename on the same tmp file for zero benefit).
+    fn save_last_seen_if_changed(&self, phone: &Phone) -> Result<()> {
+        let same = load_last_seen(&self.state_path)
+            .map(|last| {
+                last.mac == phone.mac
+                    && last.name == phone.name
+                    && last.device_name == phone.device_name
+            })
+            .unwrap_or(false);
+        if same {
+            Ok(())
+        } else {
+            self.save_last_seen(phone)
+        }
+    }
+
     /// Load-modify-save on state.json, preserving fields other than the one
     /// being updated (a pid write must not drop the remembered phone and vice
     /// versa).
@@ -725,7 +764,7 @@ impl App {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.tmp");
+        let tmp = tmp_path(path);
         std::fs::write(&tmp, serde_json::to_string_pretty(val)?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -759,6 +798,20 @@ fn config_dir() -> PathBuf {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
         });
     base.join("phone-audio")
+}
+
+/// A tmp path unique per writer per call: the GUI's 1/sec status poll and a
+/// toggle worker both write state.json from the same process, so a shared
+/// tmp name would let one writer's rename clobber the other's in-flight bytes
+/// (lost update -> dropped loopback pid -> `on` later spawns a duplicate
+/// pw-loopback). The rename-to-final stays atomic; each writer's bytes are
+/// complete before its own rename.
+fn tmp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(tmp)
 }
 
 /// Missing or malformed file -> None (no selection; next set-phone rewrites it).

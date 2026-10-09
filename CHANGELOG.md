@@ -8,6 +8,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `phone-audio-core`: `phone-audio off` never aborts on state-write errors — a
+  read-only state dir now warns and still kills the loopback, drops the profile
+  and disconnects.
+- `phone-audio-core`: status no longer rewrites `state.json` when the remembered
+  phone is unchanged (it used to write every 1 s poll, racing the toggle
+  worker's pid write on the same tmp file); state tmp writes now use a unique
+  per-writer filename, so two writers can never rename over each other's
+  in-flight bytes and lose the loopback pid.
+- `phone-audio-cli`: new `phone-audio forget` command drops a stale remembered
+  phone (`last_seen`) from `state.json` — after unpairing, status reports no
+  phone again; `phone-audio debug` now shows `last_seen` and points at it.
 - `phone-audio-core`: `phone-audio on` now reconnects a configured phone with
   `bluetoothctl connect` when it is absent (waiting up to ~15 s for its card),
   waits up to ~30 s for the phone to actually stream (polling every 500 ms,

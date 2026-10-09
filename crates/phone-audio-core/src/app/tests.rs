@@ -2,6 +2,7 @@
 //! These never touch the real machine: no phone, no PipeWire required.
 
 use std::collections::VecDeque;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -307,6 +308,13 @@ fn default_sink_out() -> CmdOut {
     FakeRunner::ok(&format!("{SINK}\n"))
 }
 
+/// Inode of a file (0 when absent): save_json replaces the final file via
+/// rename, so a rewrite changes the inode and a non-write keeps it. A
+/// granularity-free "was state.json rewritten?" probe for the W1 test.
+fn file_ino(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
+}
+
 // ---- list / status -------------------------------------------------------
 
 #[test]
@@ -347,6 +355,11 @@ fn status_empty_scan_keeps_configured_phone_available() {
     assert!(s.profile.is_none());
     assert_eq!(s.phones.len(), 1);
     assert_eq!(s.phones[0].mac, MAC);
+    assert_eq!(
+        s.phone.as_ref().unwrap().mac,
+        MAC,
+        "known phone also in `phone`"
+    );
     assert_eq!(s.reason, RECONNECT_REASON);
 }
 
@@ -384,6 +397,11 @@ fn status_empty_scan_uses_last_seen_phone_when_unconfigured() {
             device_name: DEVICE_NAME.into(),
             device_id: 0,
         }]
+    );
+    assert_eq!(
+        s.phone.as_ref().unwrap().mac,
+        MAC,
+        "known phone also in `phone`"
     );
     assert_eq!(s.reason, RECONNECT_REASON);
 }
@@ -485,6 +503,49 @@ fn status_persists_last_seen_phone_when_device_present() {
     assert_eq!(last.mac, MAC);
     assert_eq!(last.name, "Maxii");
     assert_eq!(last.device_name, DEVICE_NAME);
+}
+
+#[test]
+fn status_does_not_rewrite_state_when_phone_unchanged() {
+    // W1: the GUI polls status once a second while a toggle worker may be
+    // writing the loopback pid. status must not rewrite state.json when the
+    // remembered phone is unchanged — a same-content rewrite is pure race
+    // surface. save_json replaces the file via rename, so a rewrite shows as
+    // a new inode; no write keeps the same inode.
+    let dir = tmp_dir("status-no-rewrite");
+    let state = dir.join("state.json");
+    let fake = FakeRunner::new(vec![
+        one_phone_dump("a2dp-source"),
+        FakeRunner::ok("Volume: 0.5\n"),
+        one_phone_dump("a2dp-source"),
+        FakeRunner::ok("Volume: 0.5\n"),
+        dump_json(&[other_device()], &[source_node(), alsa_sink()]),
+    ]);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+
+    app.status().unwrap(); // first poll persists last_seen
+    let ino_first = file_ino(&state);
+    let bytes = std::fs::read(&state).unwrap();
+
+    app.status().unwrap(); // same phone again -> must not rewrite
+    assert_eq!(
+        file_ino(&state),
+        ino_first,
+        "polling status with an unchanged phone must not rewrite state.json"
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), bytes);
+
+    // Control: a different phone in the scan DOES rewrite (the mechanism is
+    // live, it just skips no-op writes).
+    app.status().unwrap();
+    assert_ne!(
+        file_ino(&state),
+        ino_first,
+        "a changed phone must rewrite last_seen"
+    );
+    // 3 scans total; the AA:BB phone has no bluez_input node, so no volume call.
+    assert_eq!(log.calls().len(), 5);
 }
 
 #[test]
@@ -627,6 +688,39 @@ fn turn_on_switches_profile_then_loops_back_and_persists_pid() {
     let stored: StateFile =
         serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
     assert_eq!(stored.loopback_pid, Some(1000));
+}
+
+#[test]
+fn turn_on_pid_write_preserves_last_seen() {
+    // S4: turn_on writes the loopback pid via a load-modify-save; the
+    // remembered phone must survive that write (a pid write is never an
+    // excuse to drop last_seen, and vice versa).
+    let dir = tmp_dir("turn-on-preserve");
+    let state = dir.join("state.json");
+    let stale = std::process::id(); // not a pw-loopback -> not alive -> respawn
+    std::fs::write(
+        &state,
+        format!(
+            "{{\"loopback_pid\": {stale}, \"last_seen\": {{\"mac\": \"{MAC}\", \"name\": \"Maxii\", \"device_name\": \"{DEVICE_NAME}\"}}}}"
+        ),
+    )
+    .unwrap();
+    let responses = vec![
+        one_phone_dump("a2dp-source"), // discovery
+        FakeRunner::ok(enum_profiles_text()),
+        one_phone_dump("a2dp-source"), // wait_for_source finds the node
+        default_sink_out(),
+    ];
+    let fake = FakeRunner::new(responses);
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_on().unwrap();
+
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(stored.loopback_pid, Some(1000), "pid written by turn_on");
+    let last = stored.last_seen.expect("pid write must keep last_seen");
+    assert_eq!(last.mac, MAC);
+    assert_eq!(last.name, "Maxii");
 }
 
 #[test]
@@ -1085,6 +1179,89 @@ fn turn_off_keeps_last_seen_phone_so_status_still_finds_it() {
     assert_eq!(s.phones.len(), 1);
     assert_eq!(s.phones[0].mac, MAC);
     assert_eq!(s.reason, RECONNECT_REASON);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn turn_off_state_write_failure_still_drops_profile_and_disconnects() {
+    // W2: a read-only state dir makes clear_state() fail (EACCES writing the
+    // tmp file). off must warn and STILL kill the loopback, drop the profile
+    // and disconnect — no state write error may abort the request. (Note: as
+    // root the chmod does not block writes, so the assertions here drive on
+    // the commands that must run either way.)
+    let dir = tmp_dir("turn-off-state-fail");
+    let state = dir.join("state.json");
+    let mut child = spawn_loopback(&dir.join("pw-loopback"));
+    std::fs::write(&state, format!("{{\"loopback_pid\": {}}}", child.id())).unwrap();
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o500); // r-x: state.json readable, tmp write/rename denied
+    std::fs::set_permissions(&dir, perms).unwrap();
+
+    let responses = vec![
+        FakeRunner::ok(""),            // kill
+        one_phone_dump("a2dp-source"), // scan
+        FakeRunner::ok(""),            // pactl set-card-profile off
+        FakeRunner::ok(""),            // bluetoothctl disconnect
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state, None);
+    app.turn_off().unwrap();
+
+    let calls = log.calls();
+    assert_eq!(calls[0], ["kill", &child.id().to_string()]);
+    assert_eq!(calls[2], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
+    assert_eq!(calls[3], ["bluetoothctl", "disconnect", MAC]);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn forget_drops_last_seen_keeps_pid_and_status_reports_no_phone() {
+    // W3: after unpairing, a stale last_seen keeps reporting an available
+    // phone forever. `forget` drops only last_seen — the loopback pid is
+    // untouched and the file stays valid; status then reports no phone.
+    let dir = tmp_dir("forget");
+    let state = dir.join("state.json");
+    let mut child = spawn_loopback(&dir.join("pw-loopback"));
+    std::fs::write(
+        &state,
+        format!(
+            "{{\"loopback_pid\": {}, \"last_seen\": {{\"mac\": \"{MAC}\", \"name\": \"Maxii\", \"device_name\": \"{DEVICE_NAME}\"}}}}",
+            child.id()
+        ),
+    )
+    .unwrap();
+    let mut app = App::with_paths(
+        Box::new(FakeRunner::new(vec![])),
+        dir.join("config.json"),
+        state.clone(),
+        None,
+    );
+    app.forget().unwrap();
+
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(stored.last_seen, None, "last_seen dropped by forget");
+    assert_eq!(
+        stored.loopback_pid,
+        Some(child.id()),
+        "forget keeps the loopback pid"
+    );
+
+    // With nothing remembered, an empty scan reports no phone again.
+    let mut app2 = App::with_paths(
+        Box::new(FakeRunner::new(vec![dump_json(&[], &[alsa_sink()])])),
+        dir.join("config.json"),
+        state,
+        None,
+    );
+    let s = app2.status().unwrap();
+    assert!(!s.available, "forgotten phone is no longer available");
+    assert!(s.phone.is_none());
 
     let _ = child.kill();
     let _ = child.wait();

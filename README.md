@@ -41,6 +41,7 @@ phone-audio status      # phone, profile, on/off, volume
 phone-audio status --json
 phone-audio list        # connected bluetooth phones
 phone-audio set-phone NAME_OR_MAC   # remember which phone (name or MAC)
+phone-audio forget     # forget a remembered phone (stale entry, e.g. after unpairing)
 phone-audio volume 80   # set phone volume 0-100
 phone-audio toggle
 phone-audio debug       # troubleshooting dump
@@ -48,6 +49,9 @@ phone-audio-gui         # small window with phone picker, toggle and volume
 ```
 
 State and selection live in `~/.config/phone-audio/{config,state}.json`.
+
+Forget a stale phone entry: `phone-audio forget` (or delete
+`~/.config/phone-audio/state.json`).
 
 > **GUI + MangoHUD**: if `MANGOHUD=1` is set session-wide, launch the GUI with
 > `env -u MANGOHUD phone-audio-gui` so the overlay doesn't cover the window
