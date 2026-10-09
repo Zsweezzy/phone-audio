@@ -88,10 +88,33 @@ struct ConfigFile {
     phone_mac: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// A remembered phone, persisted in state.json so a disconnected phone stays
+/// known: status keeps reporting it as available and `turn_on` can reconnect it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LastSeen {
+    mac: String,
+    name: String,
+    device_name: String,
+}
+
+impl LastSeen {
+    /// A displayable phone; the card id is unknown outside a scan, so 0.
+    fn into_phone(self) -> Phone {
+        Phone {
+            mac: self.mac,
+            name: self.name,
+            device_name: self.device_name,
+            device_id: 0,
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct StateFile {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     loopback_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen: Option<LastSeen>,
 }
 
 /// The app. Holds its configuration/state paths and the command runner.
@@ -164,17 +187,35 @@ impl App {
         let scan = self.scan()?;
         let phones: Vec<Phone> = scan.devices.iter().map(|d| d.phone.clone()).collect();
         if scan.devices.is_empty() {
+            // A known-but-disconnected phone (configured MAC, or remembered in
+            // state after `off`) is still available: the reason points at the
+            // reconnect flow and consumers keep the toggle enabled. Only when
+            // nothing is known is the phone truly gone.
+            if let Some(known) = self.known_phone() {
+                return Ok(Status {
+                    available: true,
+                    phones: vec![known],
+                    reason: RECONNECT_REASON.into(),
+                    ..Default::default()
+                });
+            }
             return Ok(Status {
                 available: false,
-                reason: if self.phone_mac.is_some() {
-                    RECONNECT_REASON
-                } else {
-                    NO_PHONE_REASON
-                }
-                .into(),
+                reason: NO_PHONE_REASON.into(),
                 phones,
                 ..Default::default()
             });
+        }
+        // Remember the phone we'd pick (or the first one for an unconfigured
+        // multi-phone scan) so `off` and a later reconnect still know it once
+        // the card is gone. Best-effort: state is disposable and a read-only
+        // config dir must not break status.
+        if let Some(p) = self
+            .pick_phone(&scan)
+            .or_else(|| scan.devices.first())
+            .map(|d| &d.phone)
+        {
+            let _ = self.save_last_seen(p);
         }
         let Some(dev) = self.pick_phone(&scan) else {
             let reason = if self.phone_mac.is_some() {
@@ -229,18 +270,25 @@ impl App {
     pub fn turn_on(&mut self) -> Result<()> {
         let mut scan = self.scan()?;
         if self.pick_phone(&scan).is_none() {
-            match self.phone_mac.clone() {
+            // Reconnect target: the configured MAC, else the last remembered
+            // phone (so the unconfigured GUI/bar toggle works after `off`).
+            let target = self
+                .phone_mac
+                .clone()
+                .or_else(|| load_last_seen(&self.state_path).map(|p| p.mac));
+            match target {
                 Some(mac) => {
-                    // The configured phone is absent: reconnect it, then wait
-                    // for its card to come back into the scan.
-                    self.run(&["bluetoothctl", "connect", &mac])?;
+                    // Best-effort connect: the phone may be genuinely absent,
+                    // in which case wait_for_card surfaces the real outcome.
+                    if let Err(e) = self.run(&["bluetoothctl", "connect", &mac]) {
+                        eprintln!("phone-audio: warning: bluetoothctl connect {mac}: {e}");
+                    }
                     self.wait_for_card(&mac)?;
                     scan = self.scan()?;
                 }
                 None => {
-                    // No configured phone: nothing to reconnect to. In a
-                    // single-phone setup with nothing connected, stop here with
-                    // an actionable error instead of guessing a MAC.
+                    // Nothing to reconnect to: stop here with an actionable
+                    // error instead of guessing a MAC.
                     let msg = if scan.devices.is_empty() {
                         "no bluetooth phone connected — pair it first, then run 'phone-audio on'"
                             .to_string()
@@ -252,7 +300,12 @@ impl App {
             }
         }
         let Some(dev) = self.pick_phone(&scan) else {
-            return Err(AudioError::NotFound("no bluetooth phone connected".into()));
+            let msg = if scan.devices.is_empty() {
+                "no bluetooth phone connected".to_string()
+            } else {
+                MULTI_PHONE_REASON.to_string()
+            };
+            return Err(AudioError::NotFound(msg));
         };
         let phone = &dev.phone;
 
@@ -298,7 +351,17 @@ impl App {
     pub fn turn_off(&mut self) -> Result<()> {
         if let Some(pid) = load_pid(&self.state_path) {
             if pid_alive(pid) {
-                self.run(&["kill", &pid.to_string()])?;
+                // The loopback can exit right between the alive-check and the
+                // kill (it dies when the phone's stream drops, which off is
+                // about to cause): /proc/<pid> is the final word, and a gone
+                // pid must not abort the off-flow. A kill that fails for any
+                // other reason is equally non-fatal — the loopback is already
+                // dead or dying, so warn and carry on with the disconnect.
+                if Path::new(&format!("/proc/{pid}")).exists() {
+                    if let Err(e) = self.run(&["kill", &pid.to_string()]) {
+                        eprintln!("phone-audio: warning: could not kill loopback {pid}: {e}");
+                    }
+                }
             }
             self.clear_state()?;
         }
@@ -542,6 +605,26 @@ impl App {
         }
     }
 
+    /// The phone we know even when it is absent from the scan: the configured
+    /// MAC (preferring a matching last_seen record for its display info), else
+    /// the remembered last_seen phone. None when nothing is known at all.
+    fn known_phone(&self) -> Option<Phone> {
+        let last = load_last_seen(&self.state_path);
+        match &self.phone_mac {
+            Some(mac) => Some(
+                last.filter(|p| p.mac == *mac)
+                    .map(LastSeen::into_phone)
+                    .unwrap_or_else(|| Phone {
+                        mac: mac.clone(),
+                        name: mac.clone(),
+                        device_name: String::new(),
+                        device_id: 0,
+                    }),
+            ),
+            None => last.map(LastSeen::into_phone),
+        }
+    }
+
     /// Poll `pw-dump` up to [`WAIT_FOR_CARD_SECS`] for the configured phone's card.
     fn wait_for_card(&mut self, mac: &str) -> Result<()> {
         let polls = poll_count(WAIT_FOR_CARD_SECS);
@@ -616,12 +699,26 @@ impl App {
     }
 
     fn save_state_pid(&self, pid: u32) -> Result<()> {
-        self.save_json(
-            &self.state_path,
-            &StateFile {
-                loopback_pid: Some(pid),
-            },
-        )
+        self.save_state(|s| s.loopback_pid = Some(pid))
+    }
+
+    fn save_last_seen(&self, phone: &Phone) -> Result<()> {
+        self.save_state(|s| {
+            s.last_seen = Some(LastSeen {
+                mac: phone.mac.clone(),
+                name: phone.name.clone(),
+                device_name: phone.device_name.clone(),
+            })
+        })
+    }
+
+    /// Load-modify-save on state.json, preserving fields other than the one
+    /// being updated (a pid write must not drop the remembered phone and vice
+    /// versa).
+    fn save_state(&self, update: impl FnOnce(&mut StateFile)) -> Result<()> {
+        let mut state = load_state(&self.state_path);
+        update(&mut state);
+        self.save_json(&self.state_path, &state)
     }
 
     fn save_json<T: Serialize>(&self, path: &Path, val: &T) -> Result<()> {
@@ -634,7 +731,19 @@ impl App {
         Ok(())
     }
 
+    /// Drop the loopback pid but keep `last_seen`: a disconnected-but-known
+    /// phone must stay available so the toggle can reconnect it after `off`.
+    /// Without a last_seen the file is simply removed (nothing left to keep).
     fn clear_state(&self) -> Result<()> {
+        if let Some(last) = load_last_seen(&self.state_path) {
+            return self.save_json(
+                &self.state_path,
+                &StateFile {
+                    loopback_pid: None,
+                    last_seen: Some(last),
+                },
+            );
+        }
         match std::fs::remove_file(&self.state_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -663,12 +772,22 @@ fn load_config(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// State is disposable: any read problem just means "no loopback pid".
-fn load_pid(path: &Path) -> Option<u32> {
+/// State is disposable: any read problem just means "no state".
+fn load_state(path: &Path) -> StateFile {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<StateFile>(&s).ok())
-        .and_then(|s| s.loopback_pid)
+        .unwrap_or_default()
+}
+
+/// Missing or malformed state -> no loopback pid.
+fn load_pid(path: &Path) -> Option<u32> {
+    load_state(path).loopback_pid
+}
+
+/// Missing or malformed state -> no remembered phone.
+fn load_last_seen(path: &Path) -> Option<LastSeen> {
+    load_state(path).last_seen
 }
 
 /// Process-alive check; Linux-only per spec (`/proc/<pid>`).

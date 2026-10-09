@@ -102,7 +102,9 @@ impl Gui {
                             }
                         })
                         .await
-                        .expect("toggle worker panicked")
+                        // A panicked worker must not wedge the toggle: surface
+                        // it as an error instead; busy clears in ToggleDone.
+                        .map_err(|e| format!("toggle worker failed: {e}"))?
                     },
                     Msg::ToggleDone,
                 )
@@ -179,7 +181,11 @@ impl Gui {
             text(format!("{:.0}%", self.volume)).width(Length::Shrink)
         ];
 
-        let status_text = if self.status.on {
+        let status_text = if self.busy {
+            // The toggle can wait up to ~30 s (reconnect + streaming): say so
+            // instead of showing the stale reason.
+            "working…".to_string()
+        } else if self.status.on {
             "Routing phone audio to this PC".to_string()
         } else if !self.status.reason.is_empty() {
             self.status.reason.clone()

@@ -41,6 +41,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Task::perform` + `spawn_blocking` so the ~30 s wait no longer freezes the
   window; the status poll keeps ticking and repeat toggles are ignored while
   one is pending.
+- `phone-audio-core`: the last seen phone (`mac`, `name`, `device_name`) is
+  persisted in `state.json`, so after `phone-audio off` the phone stays
+  `available` in `status` ("phone not connected — run 'phone-audio on' to
+  reconnect") and `phone-audio on` reconnects the remembered phone even
+  without a configured MAC.
+- `phone-audio-core`: `phone-audio off` tolerates a vanished loopback pid
+  (skips the kill, no crash — the old /proc check raced the kill) and a
+  failing `kill` (warns, profile off + disconnect still complete).
+- `phone-audio-gui`: a failed toggle no longer panics the window, and the
+  status line shows "working…" while a toggle runs.
 
 ### Docs
 
@@ -49,6 +59,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   disconnects the phone so it plays on its own speaker (verified live on an
   iPhone) with the pairing kept; the Control-Center workaround is now just a
   footnote for phones that misbehave after `off`.
+- `README.md`: document that after `off` the phone remains `available` in
+  `status` (remembered id), so the GUI/quickshell toggle stays enabled and
+  reconnects it.
 
 ## [0.1.0] - 2026-10-09
 

@@ -72,7 +72,10 @@ State and selection live in `~/.config/phone-audio/{config,state}.json`.
 5. `turn_off` kills that PID, drops the profile, then runs
    `bluetoothctl disconnect` — the phone falls back to its own speaker
    immediately (verified on an iPhone) and stays paired; `on` reconnects it
-   automatically.
+   automatically. Since T-LIVE-5 the phone id is remembered across `off`, so
+   `status` keeps reporting the disconnected phone as `available` (reason:
+   "phone not connected — run 'phone-audio on' to reconnect") and the
+   GUI/quickshell toggle stays enabled and reconnects it.
 
 Only one abstraction is allowed out of the core: every external command goes
 through `CmdRunner`. That is what makes the whole app testable without a
@@ -114,9 +117,12 @@ Button { onClicked: PhoneAudio.toggle() }
   disconnect`) so its audio falls back to its own speaker; the pairing is
   kept. This fallback was verified live on an iPhone (audio moves back
   immediately) and works on Android phones too. `phone-audio on` reconnects
-  automatically and waits for streaming. If a phone still misbehaves after
-  `off`, pick it as the output device on the phone itself (e.g. Control
-  Center) and restart playback.
+  automatically and waits for streaming. While disconnected, `status` still
+  reports the phone as `available` ("phone not connected — run 'phone-audio
+  on' to reconnect") so the GUI/quickshell toggle stays enabled and
+  reconnects it. If a phone still misbehaves after `off`, pick it as the
+  output device on the phone itself (e.g. Control Center) and restart
+  playback.
 - `phone-audio status --json` is the machine-readable surface for scripting
   and panels.
 

@@ -229,11 +229,69 @@ fn enum_classless_text() -> &'static str {
 "#
 }
 
+/// Unique per process + per call: the spawn-based tests leave short-lived
+/// renamed binaries that outlive a panicking test, so a reused PID (or a
+/// coarse clock) across back-to-back `cargo test` runs can otherwise make two
+/// runs collide on one path — the later copy/exec then hits a still-running
+/// orphan's executable (ETXTBSY).
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tmp_dir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("pa-test-{name}-{}", std::process::id()));
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("pa-test-{name}-{start}-{seq}"));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// ETXTBSY (os error 26): a `sleep 30` orphan from a crashed test run can still
+/// be executing its renamed image, which makes copy/spawn of that path fail.
+/// Bounded retry — the orphan exits within 30s.
+fn retry_busy<T>(mut f: impl FnMut() -> std::io::Result<T>, what: &str) -> T {
+    let mut stuck: Option<String> = None;
+    for _ in 0..50 {
+        match f() {
+            Ok(v) => return v,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                stuck = Some(e.to_string());
+            }
+            Err(e) => panic!("{what} failed: {e}"),
+        }
+    }
+    panic!("{what} still busy after retries ({stuck:?})")
+}
+
+/// Launch a fake `pw-loopback`: a copy of `sleep` renamed to the real binary
+/// name so pid_alive()'s comm check passes. Returns once /proc shows the name.
+fn spawn_loopback(exe: &Path) -> std::process::Child {
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .expect("no sleep binary to copy");
+    retry_busy(
+        || std::fs::copy(sleep, exe).map(|_| ()),
+        &format!("copy {sleep} -> {}", exe.display()),
+    );
+    let child = retry_busy(
+        || std::process::Command::new(exe).arg("30").spawn(),
+        &format!("spawn {}", exe.display()),
+    );
+    // exec runs just after spawn; wait until /proc reports the chosen name.
+    for _ in 0..100 {
+        if std::fs::read_to_string(format!("/proc/{}/comm", child.id()))
+            .map(|s| s.trim() == "pw-loopback")
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child
 }
 
 fn seed_state_pid(state: &Path) -> u32 {
@@ -269,27 +327,74 @@ fn list_phones_finds_maxii_from_dump() {
 }
 
 #[test]
-fn status_reports_reconnect_hint_when_configured_phone_absent() {
+fn status_empty_scan_keeps_configured_phone_available() {
     // Configured MAC but no device in the scan (also the post-`off` state):
-    // the reason must point at the toggle flow, not at re-picking the phone.
-    let mut app = App::with_runner(
+    // the phone stays available so the toggle stays enabled, the reason points
+    // at the reconnect flow, and phones lists the known phone.
+    let dir = tmp_dir("status-known");
+    let mut app = App::with_paths(
         Box::new(FakeRunner::new(vec![dump_json(&[], &[alsa_sink()])])),
+        dir.join("config.json"),
+        dir.join("state.json"),
         Some(MAC.into()),
     );
     let s = app.status().unwrap();
-    assert!(!s.available);
-    assert!(s.reason.contains("not connected"), "reason: {}", s.reason);
     assert!(
-        s.reason.contains("run 'phone-audio on'"),
-        "reason: {}",
-        s.reason
+        s.available,
+        "known-but-disconnected phone must stay available"
     );
+    assert!(!s.on);
+    assert!(s.profile.is_none());
+    assert_eq!(s.phones.len(), 1);
+    assert_eq!(s.phones[0].mac, MAC);
+    assert_eq!(s.reason, RECONNECT_REASON);
+}
+
+#[test]
+fn status_empty_scan_uses_last_seen_phone_when_unconfigured() {
+    // No configured MAC, but a phone was seen before and remembered in state:
+    // it stays available (reconnect reason) with last_seen as the known phone.
+    let dir = tmp_dir("status-last-seen");
+    let state = dir.join("state.json");
+    std::fs::write(
+        &state,
+        format!(
+            "{{\"last_seen\": {{\"mac\": \"{MAC}\", \"name\": \"Maxii\", \"device_name\": \"{DEVICE_NAME}\"}}}}"
+        ),
+    )
+    .unwrap();
+    let mut app = App::with_paths(
+        Box::new(FakeRunner::new(vec![dump_json(&[], &[alsa_sink()])])),
+        dir.join("config.json"),
+        state,
+        None,
+    );
+    let s = app.status().unwrap();
+    assert!(
+        s.available,
+        "remembered-but-disconnected phone stays available"
+    );
+    assert!(!s.on);
+    assert!(s.profile.is_none());
+    assert_eq!(
+        s.phones,
+        vec![Phone {
+            mac: MAC.into(),
+            name: "Maxii".into(),
+            device_name: DEVICE_NAME.into(),
+            device_id: 0,
+        }]
+    );
+    assert_eq!(s.reason, RECONNECT_REASON);
 }
 
 #[test]
 fn status_with_no_phone_is_unavailable() {
-    let mut app = App::with_runner(
+    let dir = tmp_dir("status-none");
+    let mut app = App::with_paths(
         Box::new(FakeRunner::new(vec![dump_json(&[], &[alsa_sink()])])),
+        dir.join("config.json"),
+        dir.join("state.json"),
         None,
     );
     let s = app.status().unwrap();
@@ -301,11 +406,14 @@ fn status_with_no_phone_is_unavailable() {
 
 #[test]
 fn status_with_two_phones_needs_phone_picked() {
-    let mut app = App::with_runner(
+    let dir = tmp_dir("status-two");
+    let mut app = App::with_paths(
         Box::new(FakeRunner::new(vec![dump_json(
             &[bluez_device("off"), other_device()],
             &[],
         )])),
+        dir.join("config.json"),
+        dir.join("state.json"),
         None,
     );
     let s = app.status().unwrap();
@@ -316,11 +424,14 @@ fn status_with_two_phones_needs_phone_picked() {
 
 #[test]
 fn status_with_single_phone_reports_profile_and_volume() {
-    let mut app = App::with_runner(
+    let dir = tmp_dir("status-one");
+    let mut app = App::with_paths(
         Box::new(FakeRunner::new(vec![
             one_phone_dump("a2dp-source"),
             FakeRunner::ok("Volume: 0.65\n"),
         ])),
+        dir.join("config.json"),
+        dir.join("state.json"),
         None,
     );
     let s = app.status().unwrap();
@@ -341,9 +452,39 @@ fn status_prefers_bluez5_profile_key_over_api_fallback() {
         dump_json(&[dev], &[source_node(), alsa_sink()]),
         FakeRunner::ok("Volume: 0.5\n"),
     ]);
-    let mut app = App::with_runner(Box::new(fake), None);
+    let dir = tmp_dir("status-profile");
+    let mut app = App::with_paths(
+        Box::new(fake),
+        dir.join("config.json"),
+        dir.join("state.json"),
+        None,
+    );
     let s = app.status().unwrap();
     assert_eq!(s.profile.as_deref(), Some("audio-gateway"));
+}
+
+#[test]
+fn status_persists_last_seen_phone_when_device_present() {
+    // Every status with a device present remembers it in state.json, so a
+    // later `off` + empty scan still knows which phone to reconnect.
+    let dir = tmp_dir("last-seen");
+    let state = dir.join("state.json");
+    let mut app = App::with_paths(
+        Box::new(FakeRunner::new(vec![
+            one_phone_dump("a2dp-source"),
+            FakeRunner::ok("Volume: 0.5\n"),
+        ])),
+        dir.join("config.json"),
+        state.clone(),
+        None,
+    );
+    app.status().unwrap();
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    let last = stored.last_seen.expect("last_seen persisted");
+    assert_eq!(last.mac, MAC);
+    assert_eq!(last.name, "Maxii");
+    assert_eq!(last.device_name, DEVICE_NAME);
 }
 
 #[test]
@@ -352,7 +493,13 @@ fn status_streaming_without_loopback_is_off_with_on_reason() {
     // streams and the bluez_input node exists. `on` must reflect the running
     // loopback, not the profile field.
     let fake = FakeRunner::new(vec![one_phone_dump("off"), FakeRunner::ok("Volume: 0.5\n")]);
-    let mut app = App::with_runner(Box::new(fake), None);
+    let dir = tmp_dir("status-stream");
+    let mut app = App::with_paths(
+        Box::new(fake),
+        dir.join("config.json"),
+        dir.join("state.json"),
+        None,
+    );
     let s = app.status().unwrap();
     assert!(s.available);
     assert!(!s.on);
@@ -363,11 +510,14 @@ fn status_streaming_without_loopback_is_off_with_on_reason() {
 
 #[test]
 fn status_profile_off_without_source_reports_profile_off_reason() {
-    let mut app = App::with_runner(
+    let dir = tmp_dir("status-profile-off");
+    let mut app = App::with_paths(
         Box::new(FakeRunner::new(vec![dump_json(
             &[bluez_device("off")],
             &[alsa_sink()],
         )])),
+        dir.join("config.json"),
+        dir.join("state.json"),
         None,
     );
     let s = app.status().unwrap();
@@ -377,11 +527,14 @@ fn status_profile_off_without_source_reports_profile_off_reason() {
 
 #[test]
 fn status_non_receive_profile_without_source_reports_not_streaming_reason() {
-    let mut app = App::with_runner(
+    let dir = tmp_dir("status-no-source");
+    let mut app = App::with_paths(
         Box::new(FakeRunner::new(vec![dump_json(
             &[bluez_device("a2dp-sink")],
             &[alsa_sink()],
         )])),
+        dir.join("config.json"),
+        dir.join("state.json"),
         None,
     );
     let s = app.status().unwrap();
@@ -406,20 +559,7 @@ fn status_on_true_with_live_loopback_pid_and_present_source_node() {
     let dir = tmp_dir("status-on");
     let state = dir.join("state.json");
     let exe = dir.join("pw-loopback");
-    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .expect("no sleep binary to copy");
-    std::fs::copy(sleep, &exe).unwrap();
-    let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
-    // exec runs just after spawn; wait until /proc reports the chosen name.
-    for _ in 0..100 {
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id()));
-        if comm.map(|s| s.trim() == "pw-loopback").unwrap_or(false) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let mut child = spawn_loopback(&exe);
     std::fs::write(&state, format!("{{\"loopback_pid\": {}}}", child.id())).unwrap();
 
     let fake = FakeRunner::new(vec![one_phone_dump("off"), FakeRunner::ok("Volume: 0.5\n")]);
@@ -643,6 +783,58 @@ fn turn_on_reconnects_configured_phone_when_absent() {
 }
 
 #[test]
+fn turn_on_reconnects_last_seen_phone_without_config() {
+    // After `off` the phone is gone from the scan; with no configured MAC but
+    // a last_seen phone in state, turn_on must reconnect that phone and then
+    // proceed with the normal profile flow once its card reappears.
+    let dir = tmp_dir("turn-on-last-seen");
+    let state = dir.join("state.json");
+    std::fs::write(
+        &state,
+        format!(
+            "{{\"last_seen\": {{\"mac\": \"{MAC}\", \"name\": \"Maxii\", \"device_name\": \"{DEVICE_NAME}\"}}}}"
+        ),
+    )
+    .unwrap();
+    let responses = vec![
+        dump_json(&[], &[alsa_sink()]),       // discovery: phone absent
+        FakeRunner::ok(""),                   // bluetoothctl connect (best-effort)
+        one_phone_dump("off"),                // wait_for_card poll finds the card
+        one_phone_dump("off"),                // re-scan after reconnect
+        FakeRunner::ok(enum_profiles_text()), // enum-params
+        FakeRunner::ok(""),                   // pactl set-card-profile a2dp-source
+        one_phone_dump("a2dp-source"),        // wait_for_source finds the node
+        default_sink_out(),
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_on().unwrap();
+    let calls = log.calls();
+    assert_eq!(calls[0], ["pw-dump"]);
+    assert_eq!(calls[1], ["bluetoothctl", "connect", MAC]);
+    assert_eq!(calls[2], ["pw-dump"], "wait_for_card polls for the card");
+    assert_eq!(calls[3], ["pw-dump"], "re-scan after reconnect");
+    assert_eq!(
+        calls[5],
+        ["pactl", "set-card-profile", DEVICE_NAME, "a2dp-source"]
+    );
+    assert_eq!(
+        log.detached(),
+        vec![(
+            vec![
+                "pw-loopback".into(),
+                "-C".into(),
+                SOURCE_NODE.into(),
+                "-P".into(),
+                SINK.into()
+            ],
+            1000
+        )]
+    );
+}
+
+#[test]
 fn turn_on_polls_until_source_node_appears_without_consuming_full_budget() {
     // The bluez_input node appears only on the third wait-for-source scan; the
     // poll loop must find it (with the bounded 500 ms interval, not a 30 s
@@ -716,22 +908,7 @@ fn turn_off_kills_live_loopback_drops_profile_and_disconnects() {
     let dir = tmp_dir("turn-off-live");
     let state = dir.join("state.json");
     // A real process named pw-loopback so pid_alive() reports it live.
-    let exe = dir.join("pw-loopback");
-    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .expect("no sleep binary to copy");
-    std::fs::copy(sleep, &exe).unwrap();
-    let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
-    for _ in 0..100 {
-        let ok = std::fs::read_to_string(format!("/proc/{}/comm", child.id()))
-            .map(|s| s.trim() == "pw-loopback")
-            .unwrap_or(false);
-        if ok {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let mut child = spawn_loopback(&dir.join("pw-loopback"));
     std::fs::write(&state, format!("{{\"loopback_pid\": {}}}", child.id())).unwrap();
 
     // Responses follow the run() order: kill, scan, pactl off, disconnect.
@@ -782,6 +959,135 @@ fn turn_off_disconnects_configured_phone_when_card_already_gone() {
         !calls.iter().any(|c| c[0] == "pactl"),
         "no profile drop for a missing card"
     );
+}
+
+#[test]
+fn turn_off_with_vanished_pid_still_runs_profile_off_and_disconnect() {
+    // The loopback died before `off` ran (the race the /proc re-check guards):
+    // the pid is gone, so no kill is issued and the rest still completes.
+    let dir = tmp_dir("turn-off-vanished");
+    let state = dir.join("state.json");
+    let mut child = spawn_loopback(&dir.join("pw-loopback"));
+    let pid = child.id();
+    let _ = child.kill();
+    let _ = child.wait(); // reaped: /proc/<pid> is gone before turn_off runs
+
+    std::fs::write(&state, format!("{{\"loopback_pid\": {pid}}}")).unwrap();
+    let responses = vec![
+        one_phone_dump("a2dp-source"), // scan
+        FakeRunner::ok(""),            // pactl set-card-profile off
+        FakeRunner::ok(""),            // bluetoothctl disconnect
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_off().unwrap();
+
+    let calls = log.calls();
+    assert!(
+        !calls.iter().any(|c| c[0] == "kill"),
+        "no kill for a vanished pid"
+    );
+    assert_eq!(calls[0], ["pw-dump"]);
+    assert_eq!(calls[1], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
+    assert_eq!(calls[2], ["bluetoothctl", "disconnect", MAC]);
+}
+
+#[test]
+fn turn_off_kill_failure_still_runs_profile_off_and_disconnect() {
+    // The loopback is alive right up to the kill, but the kill command fails
+    // (e.g. EPERM): off must warn and still drop the profile + disconnect.
+    let dir = tmp_dir("turn-off-kill-fail");
+    let state = dir.join("state.json");
+    let mut child = spawn_loopback(&dir.join("pw-loopback"));
+    std::fs::write(&state, format!("{{\"loopback_pid\": {}}}", child.id())).unwrap();
+
+    let responses = vec![
+        CmdOut {
+            status: 1,
+            stdout: String::new(),
+            stderr: "Operation not permitted\n".into(),
+        },
+        one_phone_dump("a2dp-source"), // scan
+        FakeRunner::ok(""),            // pactl set-card-profile off
+        FakeRunner::ok(""),            // bluetoothctl disconnect
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_off().unwrap();
+
+    let calls = log.calls();
+    assert_eq!(
+        calls[0],
+        ["kill", &child.id().to_string()],
+        "kill was attempted"
+    );
+    assert_eq!(calls[1], ["pw-dump"]);
+    assert_eq!(calls[2], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
+    assert_eq!(calls[3], ["bluetoothctl", "disconnect", MAC]);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn turn_off_keeps_last_seen_phone_so_status_still_finds_it() {
+    // The core of T-LIVE-5: after `off` the pid is cleared but the remembered
+    // phone survives, so a fresh status still reports it (available, reconnect
+    // reason) and the toggle can bring it back.
+    let dir = tmp_dir("turn-off-keep");
+    let state = dir.join("state.json");
+    let mut child = spawn_loopback(&dir.join("pw-loopback"));
+    std::fs::write(
+        &state,
+        format!(
+            "{{\"loopback_pid\": {}, \"last_seen\": {{\"mac\": \"{MAC}\", \"name\": \"Maxii\", \"device_name\": \"{DEVICE_NAME}\"}}}}",
+            child.id()
+        ),
+    )
+    .unwrap();
+
+    let responses = vec![
+        FakeRunner::ok(""),            // kill
+        one_phone_dump("a2dp-source"), // scan
+        FakeRunner::ok(""),            // pactl set-card-profile off
+        FakeRunner::ok(""),            // bluetoothctl disconnect
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_off().unwrap();
+
+    let calls = log.calls();
+    assert_eq!(calls[0], ["kill", &child.id().to_string()]);
+    assert_eq!(calls[2], ["pactl", "set-card-profile", DEVICE_NAME, "off"]);
+    assert_eq!(calls[3], ["bluetoothctl", "disconnect", MAC]);
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert!(stored.loopback_pid.is_none(), "pid cleared on off");
+    assert_eq!(
+        stored.last_seen.as_ref().unwrap().mac,
+        MAC,
+        "last_seen survives off"
+    );
+
+    // The post-`off` status: empty scan, remembered phone -> available + reason.
+    let mut app2 = App::with_paths(
+        Box::new(FakeRunner::new(vec![dump_json(&[], &[alsa_sink()])])),
+        dir.join("config.json"),
+        state,
+        None,
+    );
+    let s = app2.status().unwrap();
+    assert!(s.available);
+    assert!(!s.on);
+    assert_eq!(s.phones.len(), 1);
+    assert_eq!(s.phones[0].mac, MAC);
+    assert_eq!(s.reason, RECONNECT_REASON);
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---- volume / set-phone / config -----------------------------------------
