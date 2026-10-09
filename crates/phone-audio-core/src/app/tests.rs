@@ -116,11 +116,13 @@ fn other_device() -> serde_json::Value {
 }
 
 fn source_node() -> serde_json::Value {
+    // Real pipewire 1.6.9 emits the bluez input node as Stream/Output/Audio,
+    // not Audio/Source — the app must find it by node.name, not media.class.
     serde_json::json!({
         "id": 51,
         "type": "PipeWire:Interface:Node",
         "info": { "props": {
-            "media.class": "Audio/Source",
+            "media.class": "Stream/Output/Audio",
             "device.api": "bluez5",
             "node.name": SOURCE_NODE,
             "node.description": "Maxii",
@@ -319,6 +321,94 @@ fn status_prefers_bluez5_profile_key_over_api_fallback() {
     let mut app = App::with_runner(Box::new(fake), None);
     let s = app.status().unwrap();
     assert_eq!(s.profile.as_deref(), Some("audio-gateway"));
+}
+
+#[test]
+fn status_streaming_without_loopback_is_off_with_on_reason() {
+    // Real state (pipewire 1.6.9): bluez5.profile stays "off" while the phone
+    // streams and the bluez_input node exists. `on` must reflect the running
+    // loopback, not the profile field.
+    let fake = FakeRunner::new(vec![one_phone_dump("off"), FakeRunner::ok("Volume: 0.5\n")]);
+    let mut app = App::with_runner(Box::new(fake), None);
+    let s = app.status().unwrap();
+    assert!(s.available);
+    assert!(!s.on);
+    assert_eq!(s.profile.as_deref(), Some("off"));
+    assert_eq!(s.reason, "streaming — run 'phone-audio on'");
+    assert_eq!(s.volume, Some(50.0));
+}
+
+#[test]
+fn status_profile_off_without_source_reports_profile_off_reason() {
+    let mut app = App::with_runner(
+        Box::new(FakeRunner::new(vec![dump_json(
+            &[bluez_device("off")],
+            &[alsa_sink()],
+        )])),
+        None,
+    );
+    let s = app.status().unwrap();
+    assert!(!s.on);
+    assert_eq!(s.reason, "profile off — run 'phone-audio on'");
+}
+
+#[test]
+fn status_non_receive_profile_without_source_reports_not_streaming_reason() {
+    let mut app = App::with_runner(
+        Box::new(FakeRunner::new(vec![dump_json(
+            &[bluez_device("a2dp-sink")],
+            &[alsa_sink()],
+        )])),
+        None,
+    );
+    let s = app.status().unwrap();
+    assert!(!s.on);
+    assert_eq!(s.reason, "not streaming — start playback on the phone");
+}
+
+#[test]
+fn is_on_requires_live_loopback_pid_and_present_source() {
+    // Pure on-decision truth table (status() delegates to this).
+    assert!(is_on(true, true));
+    assert!(!is_on(true, false));
+    assert!(!is_on(false, true));
+    assert!(!is_on(false, false));
+}
+
+#[test]
+fn status_on_true_with_live_loopback_pid_and_present_source_node() {
+    // status() reads /proc/<pid> and demands comm == "pw-loopback", so hand it
+    // a real live process with that name: a copy of `sleep` renamed. The on
+    // decision must not depend on the profile (which stays "off" while live).
+    let dir = tmp_dir("status-on");
+    let state = dir.join("state.json");
+    let exe = dir.join("pw-loopback");
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("no sleep binary to copy");
+    std::fs::copy(sleep, &exe).unwrap();
+    let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
+    // exec runs just after spawn; wait until /proc reports the chosen name.
+    for _ in 0..100 {
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", child.id()));
+        if comm.map(|s| s.trim() == "pw-loopback").unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::fs::write(&state, format!("{{\"loopback_pid\": {}}}", child.id())).unwrap();
+
+    let fake = FakeRunner::new(vec![one_phone_dump("off"), FakeRunner::ok("Volume: 0.5\n")]);
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state, None);
+    let s = app.status().unwrap();
+    assert!(s.on);
+    assert_eq!(s.reason, "");
+    assert_eq!(s.profile.as_deref(), Some("off"));
+    assert_eq!(s.volume, Some(50.0));
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---- turn_on -------------------------------------------------------------

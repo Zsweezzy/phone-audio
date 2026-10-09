@@ -61,9 +61,11 @@ State and selection live in `~/.config/phone-audio/{config,state}.json`.
    `audio-gateway` → any available profile exposing an `Audio/Source` class or
    a known receive profile name (bluez cards don't emit class structs).
 3. `pactl set-card-profile` switches to it (skipped if already active).
-4. It waits (up to ~2.5 s) for the `bluez_input.<mac>.1` source node, then
+4. It waits (up to ~2.5 s) for the `bluez_input.<mac>.*` source node, then
    starts `pw-loopback` from it to the default sink in the background and
-   records the PID.
+   records the PID. This node only appears while the phone actually streams,
+   so run `on` while/after playback starts — it waits ~2.5 s — or press play
+   on the phone first, then run `on`.
 5. `turn_off` kills that PID and sets the profile back to `off`.
 
 Only one abstraction is allowed out of the core: every external command goes
@@ -95,9 +97,13 @@ Button { onClicked: PhoneAudio.toggle() }
   bluetooth role config includes `a2dp_source` in `bluez5.roles` (the
   `bluez5.profile` of the card must be switchable to it).
 - After `phone-audio on`, the `bluez_input.<mac>.*` source node only appears
-  once the phone actually streams — if nothing happens, start playback on the
-  phone (the status line repeats this as "not streaming — start playback on
-  the phone").
+  once the phone actually streams — start playback if `on` times out. The
+  status line names the missing step: "streaming — run 'phone-audio on'"
+  (node present, loopback not started), "profile off — run 'phone-audio on'",
+  or "not streaming — start playback on the phone".
+- While streaming, the card's `bluez5.profile` may still read `off` — that is
+  normal idle BlueZ state. `status` reports `on: true` from the live loopback
+  plus the present source node, not from the profile.
 - `phone-audio status --json` is the machine-readable surface for scripting
   and panels.
 

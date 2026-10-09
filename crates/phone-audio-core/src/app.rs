@@ -10,7 +10,6 @@ use serde_json::Value;
 use crate::cmd::{CmdOut, CmdRunner, RealRunner};
 use crate::pw::{
     mac_underscored, obj_id, obj_type, parse_profiles, parse_volume, pick_receive_profile, props,
-    RECEIVE_PROFILES,
 };
 use crate::{AudioError, Result};
 
@@ -163,11 +162,11 @@ impl App {
         let profile = dev.profile.clone();
         let pid = load_pid(&self.state_path);
         let pid_alive = pid.is_some_and(pid_alive);
-        let on = pid_alive
-            && profile
-                .as_deref()
-                .is_some_and(|p| RECEIVE_PROFILES.contains(&p));
         let source = find_source(&scan, &dev.phone.mac);
+        // on = our loopback is live AND the phone's source node exists. The
+        // bluez5.profile stays "off" even while streaming (it reflects the idle
+        // BlueZ connection state), so it can't drive the on/off decision.
+        let on = is_on(pid_alive, source.is_some());
         let volume = match source {
             Some(node) => self
                 .run(&["wpctl", "get-volume", &node.id.to_string()])
@@ -178,12 +177,12 @@ impl App {
         };
         let reason = if on {
             String::new()
-        } else if source.is_none() {
-            "not streaming — start playback on the phone".into()
+        } else if source.is_some() {
+            "streaming — run 'phone-audio on'".into()
         } else if profile.as_deref() == Some("off") {
             "profile off — run 'phone-audio on'".into()
         } else {
-            String::new()
+            "not streaming — start playback on the phone".into()
         };
         Ok(Status {
             available: true,
@@ -452,10 +451,14 @@ impl App {
                             .unwrap_or("")
                             .to_string(),
                     };
-                    match media {
-                        Some("Audio/Source") => scan.sources.push(node),
-                        Some("Audio/Sink") => scan.sinks.push(node),
-                        _ => {}
+                    // PipeWire 1.6.x emits the bluez input node as
+                    // Stream/Output/Audio (not Audio/Source), so the name prefix
+                    // is the reliable signal; the class-based push stays for
+                    // other configurations.
+                    if node.name.starts_with("bluez_input.") || media == Some("Audio/Source") {
+                        scan.sources.push(node);
+                    } else if media == Some("Audio/Sink") {
+                        scan.sinks.push(node);
                     }
                 }
                 _ => {}
@@ -603,6 +606,12 @@ fn find_source<'a>(scan: &'a Scan, mac: &str) -> Option<&'a BlueNode> {
         .iter()
         .filter(|n| n.name.starts_with(&prefix))
         .min_by_key(|n| if n.name.ends_with(".monitor") { 1 } else { 0 })
+}
+
+/// The on/off decision: our loopback pid is alive `&&` the phone's bluez input
+/// source node exists (profile is idle-state info and can't carry this).
+fn is_on(pid_alive: bool, source: bool) -> bool {
+    pid_alive && source
 }
 
 #[cfg(test)]

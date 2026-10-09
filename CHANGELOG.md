@@ -16,6 +16,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   works on a card that only offers `off` + `audio-gateway`.
 - `phone-audio.desktop`: launch the GUI with `env -u MANGOHUD` so the overlay
   doesn't cover the window when `MANGOHUD=1` is set session-wide.
+- `phone-audio-core`: find the bluez input node by its `bluez_input.<mac>.*`
+  name instead of `media.class = "Audio/Source"` — PipeWire 1.6.x exposes the
+  streaming capture node as `Stream/Output/Audio`, so `on`/`volume` now work
+  against a real phone.
+- `phone-audio-core`: report `on` from the live loopback plus the present
+  source node rather than the card's `bluez5.profile`, which stays `off` while
+  streaming; status reasons now distinguish "streaming — run 'phone-audio on'",
+  "profile off — run 'phone-audio on'" and "not streaming — start playback on
+  the phone".
 
 ## [0.1.0] - 2026-10-09
 

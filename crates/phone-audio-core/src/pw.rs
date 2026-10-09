@@ -16,8 +16,7 @@ pub struct Profile {
 /// Profile names that receive phone (remote) audio. Bluez cards emit
 /// class-less `EnumProfile` blocks (PipeWire 1.6.x), so a profile is also
 /// receive-capable when its name is in this list — not just when it exposes an
-/// `Audio/Source` class. Single source of truth; also used by the app's
-/// status/on check.
+/// `Audio/Source` class. Single source of truth for profile-name matching.
 pub const RECEIVE_PROFILES: [&str; 6] = [
     "a2dp-source",
     "a2dp-duplex",
