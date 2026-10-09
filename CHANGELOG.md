@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-10
+
 ### Fixed
 
 - `phone-audio-core`: `phone-audio off` never aborts on state-write errors — a
@@ -31,23 +33,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `phone-audio-core`: status reports "phone not connected — run 'phone-audio
   on' to reconnect" when the configured phone is absent (including after
   `off`), pointing at the toggle flow instead of re-selecting the phone.
-- `phone-audio-core`: read the active bluez profile from `bluez5.profile`
-  (the key pw-dump actually emits), falling back to `api.bluez5.profile`.
-- `phone-audio-core`: pick a receive profile on real bluez cards, whose
-  `EnumProfile` blocks carry no `classes` struct — profiles are now also
-  recognized by name (`audio-gateway`, `handsfree`, ...); `phone-audio on`
-  works on a card that only offers `off` + `audio-gateway`.
-- `phone-audio.desktop`: launch the GUI with `env -u MANGOHUD` so the overlay
-  doesn't cover the window when `MANGOHUD=1` is set session-wide.
-- `phone-audio-core`: find the bluez input node by its `bluez_input.<mac>.*`
-  name instead of `media.class = "Audio/Source"` — PipeWire 1.6.x exposes the
-  streaming capture node as `Stream/Output/Audio`, so `on`/`volume` now work
-  against a real phone.
-- `phone-audio-core`: report `on` from the live loopback plus the present
-  source node rather than the card's `bluez5.profile`, which stays `off` while
-  streaming; status reasons now distinguish "streaming — run 'phone-audio on'",
-  "profile off — run 'phone-audio on'" and "not streaming — start playback on
-  the phone".
 - `phone-audio-gui`: run the on/off toggle on a background thread via
   `Task::perform` + `spawn_blocking` so the ~30 s wait no longer freezes the
   window; the status poll keeps ticking and repeat toggles are ignored while
@@ -73,6 +58,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `README.md`: document that after `off` the phone remains `available` in
   `status` (remembered id), so the GUI/quickshell toggle stays enabled and
   reconnects it.
+
+## [0.1.1] - 2026-10-09
+
+### Fixed
+
+- `phone-audio-core`: read the active bluez profile from `bluez5.profile`
+  (the key pw-dump actually emits), falling back to `api.bluez5.profile`.
+- `phone-audio-core`: pick a receive profile on real bluez cards, whose
+  `EnumProfile` blocks carry no `classes` struct — profiles are now also
+  recognized by name (`audio-gateway`, `handsfree`, ...); `phone-audio on`
+  works on a card that only offers `off` + `audio-gateway`.
+- `phone-audio.desktop`: launch the GUI with `env -u MANGOHUD` so the overlay
+  doesn't cover the window when `MANGOHUD=1` is set session-wide.
+- `phone-audio-core`: find the bluez input node by its `bluez_input.<mac>.*`
+  name instead of `media.class = "Audio/Source"` — PipeWire 1.6.x exposes the
+  streaming capture node as `Stream/Output/Audio`, so `on`/`volume` now work
+  against a real phone.
+- `phone-audio-core`: report `on` from the live loopback plus the present
+  source node rather than the card's `bluez5.profile`, which stays `off` while
+  streaming; status reasons now distinguish "streaming — run 'phone-audio on'",
+  "profile off — run 'phone-audio on'" and "not streaming — start playback on
+  the phone".
 
 ## [0.1.0] - 2026-10-09
 
