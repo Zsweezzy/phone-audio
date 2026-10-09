@@ -113,6 +113,12 @@ impl LastSeen {
 struct StateFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     loopback_pid: Option<u32>,
+    /// The bluez_input source node the recorded loopback is capturing. The name
+    /// increments when the phone's stream restarts, so a stored node different
+    /// from the current one means the loopback is stale and must be re-armed.
+    /// Absent in state files written before this field existed (→ None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loopback_node: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_seen: Option<LastSeen>,
 }
@@ -234,13 +240,23 @@ impl App {
             });
         };
         let profile = dev.profile.clone();
-        let pid = load_pid(&self.state_path);
+        let state = load_state(&self.state_path);
+        let pid = state.loopback_pid;
         let pid_alive = pid.is_some_and(pid_alive);
         let source = find_source(&scan, &dev.phone.mac);
-        // on = our loopback is live AND the phone's source node exists. The
-        // bluez5.profile stays "off" even while streaming (it reflects the idle
-        // BlueZ connection state), so it can't drive the on/off decision.
-        let on = is_on(pid_alive, source.is_some());
+        // on = our loopback is live AND the phone's source node exists AND the
+        // loopback is still pointed at that node. The bluez5.profile stays "off"
+        // even while streaming (it reflects the idle BlueZ connection state), so
+        // it can't drive the on/off decision. When the phone's stream restarts
+        // the bluez_input node name increments, leaving the old loopback on a
+        // dead name: that must read off, not a stale "on". A legacy state with
+        // no stored node reads off once; the next toggle re-arms it with the
+        // current node, permanently self-healing.
+        let node_matches = state
+            .loopback_node
+            .as_deref()
+            .is_some_and(|stored| source.is_some_and(|n| n.name == stored));
+        let on = is_on(pid_alive, source.is_some()) && node_matches;
         let volume = match source {
             Some(node) => self
                 .run(&["wpctl", "get-volume", &node.id.to_string()])
@@ -341,12 +357,33 @@ impl App {
             )));
         };
 
-        if load_pid(&self.state_path).is_some_and(pid_alive) {
-            return Ok(()); // already on
+        // "Already on" means the recorded loopback is live AND still pointed at
+        // the phone's current source node. When the stream restarts, the
+        // bluez_input node name increments (bluez_input.<mac>.1 -> .2 -> ...)
+        // and the old loopback keeps capturing a dead name while state still
+        // records it: that combination must re-arm, not no-op. A recorded but
+        // dead/zombie pid must also re-arm. Otherwise kill the stale live
+        // loopback best-effort (exactly like turn_off: /proc is the final word
+        // and a failure must never abort the flow), then spawn a fresh loopback
+        // against the current node — repeated `on` while streaming re-arms
+        // correctly and never double-runs.
+        let state = load_state(&self.state_path);
+        let pid = state.loopback_pid;
+        let already_on = pid.is_some_and(pid_alive)
+            && state.loopback_node.as_deref() == Some(node_name.as_str());
+        if !already_on {
+            if let Some(pid) = pid {
+                if pid_alive(pid) && Path::new(&format!("/proc/{pid}")).exists() {
+                    if let Err(e) = self.run(&["kill", &pid.to_string()]) {
+                        eprintln!("phone-audio: warning: could not kill stale loopback {pid}: {e}");
+                    }
+                }
+            }
+            let sink = self.default_sink()?;
+            let pid = self.run_detached(&["pw-loopback", "-C", &node_name, "-P", &sink])?;
+            self.save_state_pid(pid, &node_name)?;
         }
-        let sink = self.default_sink()?;
-        let pid = self.run_detached(&["pw-loopback", "-C", &node_name, "-P", &sink])?;
-        self.save_state_pid(pid)
+        Ok(())
     }
 
     /// Kill our loopback, drop the profile, and disconnect the phone so it
@@ -718,8 +755,11 @@ impl App {
         )
     }
 
-    fn save_state_pid(&self, pid: u32) -> Result<()> {
-        self.save_state(|s| s.loopback_pid = Some(pid))
+    fn save_state_pid(&self, pid: u32, node: &str) -> Result<()> {
+        self.save_state(|s| {
+            s.loopback_pid = Some(pid);
+            s.loopback_node = Some(node.to_string());
+        })
     }
 
     fn save_last_seen(&self, phone: &Phone) -> Result<()> {
@@ -779,6 +819,7 @@ impl App {
                 &self.state_path,
                 &StateFile {
                     loopback_pid: None,
+                    loopback_node: None,
                     last_seen: Some(last),
                 },
             );

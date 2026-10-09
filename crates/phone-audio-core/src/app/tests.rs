@@ -91,6 +91,10 @@ const MAC: &str = "28:8F:F6:71:6F:6E";
 const DEVICE_NAME: &str = "bluez_card.28_8F_F6_71_6F_6E";
 const DEVICE_ID: u32 = 45;
 const SOURCE_NODE: &str = "bluez_input.28_8F_F6_71_6F_6E.1";
+/// The node name after the phone's stream restarts once (`.1` -> `.2`): the
+/// stale-loopback scenario — the recorded loopback is alive but pointed at the
+/// old name while state still claims it is current.
+const SOURCE_NODE_2: &str = "bluez_input.28_8F_F6_71_6F_6E.2";
 const SINK: &str = "alsa_output.usb-GeneralPlus_USB_Audio_Device-00.analog-stereo";
 
 fn bluez_device(profile: &str) -> serde_json::Value {
@@ -122,6 +126,10 @@ fn other_device() -> serde_json::Value {
 }
 
 fn source_node() -> serde_json::Value {
+    source_node_named(SOURCE_NODE)
+}
+
+fn source_node_named(name: &str) -> serde_json::Value {
     // Real pipewire 1.6.9 emits the bluez input node as Stream/Output/Audio,
     // not Audio/Source — the app must find it by node.name, not media.class.
     serde_json::json!({
@@ -130,7 +138,7 @@ fn source_node() -> serde_json::Value {
         "info": { "props": {
             "media.class": "Stream/Output/Audio",
             "device.api": "bluez5",
-            "node.name": SOURCE_NODE,
+            "node.name": name,
             "node.description": "Maxii",
         }}
     })
@@ -302,6 +310,18 @@ fn seed_state_pid(state: &Path) -> u32 {
     let pid = std::process::id();
     std::fs::write(state, format!("{{\"loopback_pid\": {pid}}}")).unwrap();
     pid
+}
+
+/// State with a REAL live pw-loopback process (so `pid_alive` is true) and an
+/// optional stored capture node; returns the child so the test can reap it.
+fn seed_live_state(state: &Path, node: Option<&str>) -> std::process::Child {
+    let child = spawn_loopback(&state.parent().unwrap().join("pw-loopback"));
+    let pid = child.id();
+    let node = node
+        .map(|n| format!(", \"loopback_node\": \"{n}\""))
+        .unwrap_or_default();
+    std::fs::write(state, format!("{{\"loopback_pid\": {pid}{node}}}")).unwrap();
+    child
 }
 
 fn default_sink_out() -> CmdOut {
@@ -621,7 +641,14 @@ fn status_on_true_with_live_loopback_pid_and_present_source_node() {
     let state = dir.join("state.json");
     let exe = dir.join("pw-loopback");
     let mut child = spawn_loopback(&exe);
-    std::fs::write(&state, format!("{{\"loopback_pid\": {}}}", child.id())).unwrap();
+    std::fs::write(
+        &state,
+        format!(
+            "{{\"loopback_pid\": {}, \"loopback_node\": \"{SOURCE_NODE}\"}}",
+            child.id()
+        ),
+    )
+    .unwrap();
 
     let fake = FakeRunner::new(vec![one_phone_dump("off"), FakeRunner::ok("Volume: 0.5\n")]);
     let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state, None);
@@ -630,6 +657,50 @@ fn status_on_true_with_live_loopback_pid_and_present_source_node() {
     assert_eq!(s.reason, "");
     assert_eq!(s.profile.as_deref(), Some("off"));
     assert_eq!(s.volume, Some(50.0));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn status_reports_off_when_live_loopback_node_does_not_match_source() {
+    // Alive pid + source present, but the recorded node is the old name (the
+    // stream-restart scenario): not on. The existing reason branch points the
+    // user at the one re-toggle that kills + re-arms with the current node.
+    let dir = tmp_dir("status-node-mismatch");
+    let state = dir.join("state.json");
+    let mut child = seed_live_state(&state, Some(SOURCE_NODE)); // recorded: .1
+    let fake = FakeRunner::new(vec![
+        dump_json(
+            &[bluez_device("off")],
+            &[source_node_named(SOURCE_NODE_2), alsa_sink()],
+        ), // current: .2
+        FakeRunner::ok("Volume: 0.5\n"),
+    ]);
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state, None);
+    let s = app.status().unwrap();
+    assert!(s.available);
+    assert!(!s.on, "stale loopback on a dead node must read off");
+    assert_eq!(s.reason, "streaming — run 'phone-audio on'");
+    assert_eq!(s.volume, Some(50.0));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn status_reports_off_for_legacy_state_without_stored_node() {
+    // State files written before the node field existed have only loopback_pid:
+    // no stored node -> node_matches is false -> off (one re-toggle re-arms it
+    // with the current node, permanently self-healing).
+    let dir = tmp_dir("status-legacy-node");
+    let state = dir.join("state.json");
+    let mut child = seed_live_state(&state, None);
+    let fake = FakeRunner::new(vec![one_phone_dump("off"), FakeRunner::ok("Volume: 0.5\n")]);
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state, None);
+    let s = app.status().unwrap();
+    assert!(!s.on, "legacy state without a node must read off");
+    assert_eq!(s.reason, "streaming — run 'phone-audio on'");
 
     let _ = child.kill();
     let _ = child.wait();
@@ -969,6 +1040,98 @@ fn turn_on_polls_until_source_node_appears_without_consuming_full_budget() {
     assert_eq!(log.detached().len(), 1);
 }
 
+#[test]
+fn turn_on_kills_stale_alive_loopback_and_rearms_on_current_node() {
+    // The reported bug: the phone's stream restarted, the bluez_input node
+    // incremented (.1 -> .2), and the old pw-loopback keeps running against the
+    // dead name while state records it. turn_on must see "alive pid but stale
+    // node", kill the old loopback (exactly like turn_off), and spawn a fresh
+    // one against the current node, saving pid + node.
+    let dir = tmp_dir("turn-on-rearm");
+    let state = dir.join("state.json");
+    let mut child = seed_live_state(&state, Some(SOURCE_NODE)); // recorded node: .1
+    let responses = vec![
+        dump_json(
+            &[bluez_device("a2dp-source")],
+            &[source_node_named(SOURCE_NODE_2), alsa_sink()],
+        ), // discovery: current node .2
+        FakeRunner::ok(enum_profiles_text()),
+        dump_json(
+            &[bluez_device("a2dp-source")],
+            &[source_node_named(SOURCE_NODE_2), alsa_sink()],
+        ), // wait_for_source finds .2
+        FakeRunner::ok(""), // kill old pid
+        default_sink_out(),
+    ];
+    let fake = FakeRunner::new(responses);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_on().unwrap();
+
+    let calls = log.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c[0] == "kill" && c[1] == child.id().to_string()),
+        "stale live loopback must be killed"
+    );
+    assert_eq!(
+        log.detached(),
+        vec![(
+            vec![
+                "pw-loopback".into(),
+                "-C".into(),
+                SOURCE_NODE_2.into(),
+                "-P".into(),
+                SINK.into()
+            ],
+            1000
+        )],
+        "fresh loopback captured against the CURRENT node"
+    );
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(stored.loopback_pid, Some(1000), "new pid persisted");
+    assert_eq!(
+        stored.loopback_node.as_deref(),
+        Some(SOURCE_NODE_2),
+        "current node persisted"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn turn_on_with_matching_alive_pid_and_node_is_a_noop() {
+    // Repeated `on` while the stream is stable: alive pid AND stored node ==
+    // current node -> already on, no kill, no respawn, no state rewrite.
+    let dir = tmp_dir("turn-on-noop");
+    let state = dir.join("state.json");
+    let mut child = seed_live_state(&state, Some(SOURCE_NODE));
+    let fake = FakeRunner::new(vec![
+        one_phone_dump("a2dp-source"), // discovery
+        FakeRunner::ok(enum_profiles_text()),
+        one_phone_dump("a2dp-source"), // wait_for_source: same node
+    ]);
+    let log = fake.log();
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_on().unwrap();
+
+    assert!(
+        !log.calls().iter().any(|c| c[0] == "kill"),
+        "no kill when already on"
+    );
+    assert!(log.detached().is_empty(), "no respawn when already on");
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(stored.loopback_pid, Some(child.id()), "pid untouched");
+    assert_eq!(stored.loopback_node.as_deref(), Some(SOURCE_NODE));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 // ---- turn_off ------------------------------------------------------------
 
 #[test]
@@ -1179,6 +1342,46 @@ fn turn_off_keeps_last_seen_phone_so_status_still_finds_it() {
     assert_eq!(s.phones.len(), 1);
     assert_eq!(s.phones[0].mac, MAC);
     assert_eq!(s.reason, RECONNECT_REASON);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn turn_off_clears_pid_and_node_from_state() {
+    // The state schema change: off must clear the recorded capture node along
+    // with the pid (clear_state covers the new field), while keeping the
+    // remembered phone.
+    let dir = tmp_dir("turn-off-node");
+    let state = dir.join("state.json");
+    let mut child = spawn_loopback(&dir.join("pw-loopback"));
+    std::fs::write(
+        &state,
+        format!(
+            "{{\"loopback_pid\": {}, \"loopback_node\": \"{SOURCE_NODE}\", \"last_seen\": {{\"mac\": \"{MAC}\", \"name\": \"Maxii\", \"device_name\": \"{DEVICE_NAME}\"}}}}",
+            child.id()
+        ),
+    )
+    .unwrap();
+    let responses = vec![
+        FakeRunner::ok(""),            // kill
+        one_phone_dump("a2dp-source"), // scan
+        FakeRunner::ok(""),            // pactl set-card-profile off
+        FakeRunner::ok(""),            // bluetoothctl disconnect
+    ];
+    let fake = FakeRunner::new(responses);
+    let mut app = App::with_paths(Box::new(fake), dir.join("config.json"), state.clone(), None);
+    app.turn_off().unwrap();
+
+    let stored: StateFile =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert!(stored.loopback_pid.is_none(), "pid cleared on off");
+    assert!(stored.loopback_node.is_none(), "node cleared on off");
+    assert_eq!(
+        stored.last_seen.as_ref().unwrap().mac,
+        MAC,
+        "last_seen survives off"
+    );
 
     let _ = child.kill();
     let _ = child.wait();

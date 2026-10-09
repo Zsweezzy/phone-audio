@@ -7,14 +7,26 @@ use iced::border::Border;
 use iced::font::Weight;
 use iced::widget::container::Style as ContainerStyle;
 use iced::widget::{column, combo_box, container, row, slider, text, toggler, Space};
-use iced::{Alignment, Color, Element, Font, Length, Size, Task, Theme};
+use iced::{Alignment, Color, Element, Font, Length, Size, Subscription, Task, Theme};
 use phone_audio_core::{App, Phone, Status};
 
 fn main() -> iced::Result {
     iced::application(Gui::new, Gui::update, Gui::view)
         .title("Phone Audio")
         .theme(|_gui: &Gui| Theme::TokyoNight)
-        .subscription(|_gui: &Gui| iced::time::every(Duration::from_secs(1)).map(|_| Msg::Tick))
+        .subscription(|gui: &Gui| {
+            // 1/s status poll always; while a toggle is in flight, also spin the
+            // loading arc fast enough to look like motion.
+            let status = iced::time::every(Duration::from_secs(1)).map(|_| Msg::Tick);
+            if gui.busy {
+                Subscription::batch([
+                    status,
+                    iced::time::every(Duration::from_millis(100)).map(|_| Msg::SpinnerTick),
+                ])
+            } else {
+                status
+            }
+        })
         .window_size(Size::new(360.0, 260.0))
         .run()
 }
@@ -31,6 +43,12 @@ struct Gui {
     error: Option<String>,
     /// A toggle is running off the UI thread; ignore further toggles until it lands.
     busy: bool,
+    /// Optimistic toggle target while the off-thread toggle runs: the toggler
+    /// shows this instead of the (still stale) status so the flip is instant.
+    /// Only `Msg::ToggleDone` clears it — the 1/s status refresh must not.
+    pending: Option<bool>,
+    /// Index into the loading-arc glyphs; advanced by `Msg::SpinnerTick`.
+    spinner_phase: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -39,9 +57,14 @@ enum Msg {
     PhonePicked(String),
     Toggle,
     ToggleDone(std::result::Result<(), String>),
+    SpinnerTick,
     VolumeChanged(f32),
     VolumeReleased,
 }
+
+/// Rotating arc glyphs, one per 100 ms tick: reads as a spinning arc, renders
+/// with the normal font (no drawing widget / no feature needed).
+const SPINNER_GLYPHS: [char; 4] = ['◜', '◝', '◞', '◟'];
 
 impl Gui {
     fn new() -> Self {
@@ -60,6 +83,8 @@ impl Gui {
             dragging: false,
             error: None,
             busy: false,
+            pending: None,
+            spinner_phase: 0,
         }
     }
 
@@ -85,15 +110,19 @@ impl Gui {
             Msg::Toggle => {
                 // One toggle at a time; the wait can block ~30 s, so it runs
                 // off the UI thread on a clone of the app (state that matters
-                // lives in files, so the polling copy stays consistent).
+                // lives in files, so the polling copy stays consistent). The
+                // toggler stays visually enabled while busy, so ignore the
+                // click here — the flipped state is already shown.
                 if self.busy {
                     return Task::none();
                 }
                 let Some(app) = self.app.clone() else {
                     return Task::none();
                 };
-                self.busy = true;
                 let on = self.status.on;
+                // Flip instantly: show the target the moment the click lands.
+                self.pending = Some(!self.pending.unwrap_or(self.status.on));
+                self.busy = true;
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
@@ -113,12 +142,17 @@ impl Gui {
                 )
             }
             Msg::ToggleDone(result) => {
+                self.pending = None;
                 self.busy = false;
                 match result {
                     Ok(()) => self.error = None,
                     Err(e) => self.error = Some(e),
                 }
                 self.refresh();
+                Task::none()
+            }
+            Msg::SpinnerTick => {
+                self.spinner_phase = (self.spinner_phase + 1) % SPINNER_GLYPHS.len();
                 Task::none()
             }
             Msg::VolumeChanged(v) => {
@@ -155,6 +189,17 @@ impl Gui {
             Err(e) => self.error = Some(e.to_string()),
         }
         let options: Vec<String> = self.phones.iter().map(|p| p.to_string()).collect();
+        // Auto-select the first phone when nothing is selected yet or the
+        // selection vanished from the scan. Display-only: never calls
+        // set_phone/App on auto-select.
+        if !options.is_empty()
+            && self
+                .selection
+                .as_ref()
+                .is_none_or(|sel| !options.contains(sel))
+        {
+            self.selection = Some(options[0].clone());
+        }
         // Rebuild only on an actual change so an open dropdown survives ticks.
         if self.combo.options() != options.as_slice() {
             self.combo = combo_box::State::with_selection(options, self.selection.as_ref());
@@ -170,11 +215,13 @@ impl Gui {
         )
         .width(Length::Fill);
 
-        let mut tgl = toggler(self.status.on)
+        let mut tgl = toggler(self.pending.unwrap_or(self.status.on))
             .label("On main speakers")
             .size(15.0)
             .spacing(8);
-        if self.status.available && !self.busy {
+        // Visually enabled even while busy: the defensive busy guard in
+        // update() ignores the click, and the flipped value is already shown.
+        if self.status.available {
             tgl = tgl.on_toggle(|_| Msg::Toggle);
         }
 
@@ -249,7 +296,18 @@ impl Gui {
         .padding(10)
         .style(|_| card());
 
-        let mut col = column![header, phone_card, tgl].spacing(10);
+        let mut toggle_row = row![tgl];
+        if self.busy {
+            // Small (~14px) rotating arc next to the toggler while the
+            // off-thread toggle runs; nothing rendered when not busy.
+            toggle_row = toggle_row.push(
+                text(SPINNER_GLYPHS[self.spinner_phase])
+                    .size(14)
+                    .color(CYAN),
+            );
+        }
+
+        let mut col = column![header, phone_card, toggle_row].spacing(10);
 
         // Volume is only meaningful while audio is actually routed.
         if self.status.on {
