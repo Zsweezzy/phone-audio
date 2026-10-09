@@ -3,8 +3,11 @@
 
 use std::time::Duration;
 
-use iced::widget::{column, combo_box, container, row, slider, text, toggler};
-use iced::{Element, Length, Size, Task, Theme};
+use iced::border::Border;
+use iced::font::Weight;
+use iced::widget::container::Style as ContainerStyle;
+use iced::widget::{column, combo_box, container, row, slider, text, toggler, Space};
+use iced::{Alignment, Color, Element, Font, Length, Size, Task, Theme};
 use phone_audio_core::{App, Phone, Status};
 
 fn main() -> iced::Result {
@@ -12,7 +15,7 @@ fn main() -> iced::Result {
         .title("Phone Audio")
         .theme(|_gui: &Gui| Theme::TokyoNight)
         .subscription(|_gui: &Gui| iced::time::every(Duration::from_secs(1)).map(|_| Msg::Tick))
-        .window_size(Size::new(340.0, 200.0))
+        .window_size(Size::new(360.0, 260.0))
         .run()
 }
 
@@ -167,19 +170,13 @@ impl Gui {
         )
         .width(Length::Fill);
 
-        let mut tgl = toggler(self.status.on).label("On main speakers");
+        let mut tgl = toggler(self.status.on)
+            .label("On main speakers")
+            .size(15.0)
+            .spacing(8);
         if self.status.available && !self.busy {
             tgl = tgl.on_toggle(|_| Msg::Toggle);
         }
-        let profile = self.status.profile.as_deref().unwrap_or("-");
-        let toggle_row = row![tgl, text(profile).size(12)];
-
-        let volume_row = row![
-            slider(0.0..=100.0, self.volume, Msg::VolumeChanged)
-                .on_release(Msg::VolumeReleased)
-                .width(Length::Fill),
-            text(format!("{:.0}%", self.volume)).width(Length::Shrink)
-        ];
 
         let status_text = if self.busy {
             // The toggle can wait up to ~30 s (reconnect + streaming): say so
@@ -193,17 +190,114 @@ impl Gui {
             "Off".to_string()
         };
 
-        let mut col =
-            column![picker, toggle_row, volume_row, text(status_text).size(12),].spacing(8);
+        // --- Tailors grouped by current state --------------------------------
+        let has_error = self.error.is_some() || self.startup_error.is_some();
+        let dot_color = if has_error {
+            RED
+        } else if self.busy {
+            CYAN
+        } else if self.status.on {
+            GREEN
+        } else {
+            MUTED
+        };
+        let status_color = if has_error {
+            RED
+        } else if self.status.on || self.busy {
+            CYAN
+        } else {
+            MUTED
+        };
+        let (pill_text, pill_color, pill_bg) = if self.status.on {
+            ("routing to PC", GREEN, GREEN_TINT)
+        } else if self.busy {
+            ("working…", CYAN, CYAN_TINT)
+        } else {
+            ("off", MUTED, CARD_BG)
+        };
 
-        if let Some(e) = self.error.as_ref().or(self.startup_error.as_ref()) {
-            col = col.push(
-                text(e)
-                    .size(11)
-                    .color(iced::Color::from_rgba(0.9, 0.35, 0.35, 1.0)),
-            );
+        // --- Header: dot, title, spacer, state pill --------------------------
+        let header = row![
+            text("●").size(9).color(dot_color),
+            text("Phone Audio").size(14).color(FG).font(BOLD),
+            Space::new().width(Length::Fill),
+            container(text(pill_text).size(11).color(pill_color))
+                .padding([6, 12])
+                .style(move |_| pill(pill_bg)),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(8);
+
+        // --- Phone card: picker + profile chip -------------------------------
+        let profile = self.status.profile.as_deref().unwrap_or("-");
+        let profile_color = if self.status.on { CYAN } else { MUTED };
+        let phone_card = container(
+            column![
+                text("Phone").size(11).color(MUTED),
+                row![
+                    picker,
+                    container(text(profile).size(10).color(profile_color))
+                        .padding([4, 10])
+                        .style(|_| pill(CHIP_BG)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(6)
+            .width(Length::Fill),
+        )
+        .padding(10)
+        .style(|_| card());
+
+        let mut col = column![header, phone_card, tgl].spacing(10);
+
+        // Volume is only meaningful while audio is actually routed.
+        if self.status.on {
+            col = col.push(row![
+                slider(0.0..=100.0, self.volume, Msg::VolumeChanged)
+                    .on_release(Msg::VolumeReleased)
+                    .width(Length::Fill),
+                text(format!("{:.0}%", self.volume))
+                    .width(Length::Shrink)
+                    .color(FG),
+            ]);
         }
 
-        container(col).padding(10).into()
+        col = col.push(text(status_text).size(11).color(status_color));
+
+        if let Some(e) = self.error.as_ref().or(self.startup_error.as_ref()) {
+            col = col.push(text(e).size(11).color(RED));
+        }
+
+        container(col).padding(14).into()
     }
+}
+
+// --- Tokyonight-night palette -------------------------------------------------
+const FG: Color = Color::from_rgba8(0xc0, 0xca, 0xf5, 1.0);
+const MUTED: Color = Color::from_rgba8(0x56, 0x5f, 0x89, 1.0);
+const CARD_BG: Color = Color::from_rgba8(0x29, 0x2e, 0x42, 1.0);
+const BORDER: Color = Color::from_rgba8(0x3b, 0x42, 0x61, 1.0);
+const CHIP_BG: Color = Color::from_rgba8(0x1f, 0x23, 0x35, 1.0);
+const CYAN: Color = Color::from_rgba8(0x7d, 0xcf, 0xff, 1.0);
+const GREEN: Color = Color::from_rgba8(0x9e, 0xce, 0x6a, 1.0);
+const RED: Color = Color::from_rgba8(0xf7, 0x76, 0x8e, 1.0);
+const GREEN_TINT: Color = Color::from_rgba8(0x9e, 0xce, 0x6a, 0.15);
+const CYAN_TINT: Color = Color::from_rgba8(0x7d, 0xcf, 0xff, 0.15);
+const BOLD: Font = Font {
+    weight: Weight::Bold,
+    ..Font::DEFAULT
+};
+
+/// Full-width rounded card with a subtle border.
+fn card() -> ContainerStyle {
+    ContainerStyle::default()
+        .background(CARD_BG)
+        .border(Border::default().rounded(10.0).width(1.0).color(BORDER))
+}
+
+/// Fully-rounded pill (chip / state badge) with no visible border.
+fn pill(bg: Color) -> ContainerStyle {
+    ContainerStyle::default()
+        .background(bg)
+        .border(Border::default().rounded(999.0))
 }
