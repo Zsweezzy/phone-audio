@@ -26,6 +26,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "profile off — run 'phone-audio on'" and "not streaming — start playback on
   the phone".
 
+### Docs
+
+- `README.md`: document a live-verified iPhone quirk — after `phone-audio
+  off` iOS keeps its media session routed to the dropped Bluetooth path and
+  stays silent until the phone is picked as output (e.g. Control Center) or
+  playback restarts; this is the phone's media-stack behavior (no A2DP
+  transport remains on the PC side), the device stays paired, and re-running
+  `on` restores routing. Note in "How it works" that fallback to the phone's
+  own speaker depends on its media stack.
+
 ## [0.1.0] - 2026-10-09
 
 Initial release.

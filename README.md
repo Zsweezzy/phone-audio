@@ -66,7 +66,10 @@ State and selection live in `~/.config/phone-audio/{config,state}.json`.
    records the PID. This node only appears while the phone actually streams,
    so run `on` while/after playback starts — it waits ~2.5 s — or press play
    on the phone first, then run `on`.
-5. `turn_off` kills that PID and sets the profile back to `off`.
+5. `turn_off` kills that PID and sets the profile back to `off` — whether the
+   phone then falls back to its own speaker depends on the phone's media
+   stack (iOS may keep the session silent until you pick the phone as
+   output, see Troubleshooting).
 
 Only one abstraction is allowed out of the core: every external command goes
 through `CmdRunner`. That is what makes the whole app testable without a
@@ -104,6 +107,14 @@ Button { onClicked: PhoneAudio.toggle() }
 - While streaming, the card's `bluez5.profile` may still read `off` — that is
   normal idle BlueZ state. `status` reports `on: true` from the live loopback
   plus the present source node, not from the profile.
+- After `phone-audio off` the phone may stay silent: iOS keeps its audio
+  routed to the (now dropped) Bluetooth path and does not fall back to its
+  own speaker until you pick the phone as output in the phone's audio picker
+  (e.g. Control Center) or restart playback. This is the phone's media stack,
+  not the PC — no A2DP transport exists on the PC side while off (check
+  `pw-dump`). The device stays paired: run `phone-audio on` again with
+  playback started or starting and routing is restored. Many Android phones
+  resume on their own speaker immediately and need none of this.
 - `phone-audio status --json` is the machine-readable surface for scripting
   and panels.
 
