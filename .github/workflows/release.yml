@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -41,4 +44,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: phone-audio-*.tar.gz
-          generate_release_notes: true
+          body: |
+            Prebuilt release binaries for x86_64 Linux (Arch tested).
+
+            Install: download `phone-audio-${{ github.ref_name }}.tar.gz`, extract, and run `./install.sh`.
+            Usage: `phone-audio on|off|toggle|status|volume`, plus the `phone-audio-gui` window and the
+            `quickshell/PhoneAudio.qml` shim (see README.md).
