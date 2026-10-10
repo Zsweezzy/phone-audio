@@ -28,11 +28,7 @@ pub struct RealRunner;
 impl CmdRunner for RealRunner {
     fn run(&mut self, args: &[&str]) -> Result<CmdOut> {
         let (prog, rest) = args.split_first().unwrap_or((&"", &[]));
-        let output = if rest.is_empty() {
-            Command::new(prog).output()
-        } else {
-            Command::new(prog).args(rest).output()
-        }?;
+        let output = Command::new(prog).args(rest).output()?;
         Ok(CmdOut {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
