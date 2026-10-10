@@ -6,6 +6,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-10
+
+### Fixed
+
+- `phone-audio-core`: a stale `pw-loopback` (whose captured bluez input node
+  name no longer exists — the node index increments on every stream restart)
+  previously made `on`/`toggle` a no-op: "pid alive" was treated as "routing
+  healthy". State now stores the loopback's node name alongside its pid;
+  `status` reports `on` only when the stored node matches the live source
+  node, and `turn_on` re-arms by killing the orphaned loopback and spawning a
+  fresh one on the current node. One re-toggle heals legacy states.
+- `phone-audio-gui`: the toggle now flips instantly (optimistic) with a small
+  spinning indicator while the operation runs, instead of waiting for the
+  reconnect/stream wait to finish.
+
+### Added
+
+- `phone-audio-gui`: visual redesign — status dot + state pill header, phone
+  card with profile chip, volume row only while routing, color-coded status
+  line, brighter muted text for contrast.
+- `phone-audio-gui`: the phone picker auto-selects the first available device.
+- `quickshell`: `PhoneAudio.setVolume` shim and a volume slider in the live
+  flyout's PHONE AUDIO section (wired to `phone-audio volume`).
+
 ## [0.1.2] - 2026-10-10
 
 ### Fixed
