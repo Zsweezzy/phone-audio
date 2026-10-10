@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-10
+
+### Removed
+
+- `phone-audio-core`: dead crate-root re-exports of the internal `cmd` runner
+  and `pw` parser helpers (`CmdOut`, `CmdRunner`, `RealRunner`,
+  `parse_profiles`, `parse_volume`, `pick_receive_profile`) — none of them had
+  consumers outside the crate; callers import them via `crate::` paths.
+- `phone-audio-core`: redundant empty-argv branch in `RealRunner::run` —
+  `Command::new(prog).args([])` handles the empty case natively.
+
+### Changed
+
+- Repository hygiene: `Cargo.lock` is synced with the workspace version again
+  (it had drifted to 0.1.2 after the 0.1.3 release because the lockfile was not
+  committed with the version bump).
+
 ## [0.1.3] - 2026-10-10
 
 ### Fixed
