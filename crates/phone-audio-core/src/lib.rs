@@ -1,14 +1,7 @@
-//! phone-audio-core — routes a Bluetooth phone's audio to this PC via PipeWire.
-//!
-//! Everything shells out through `CmdRunner`; nothing talks to PipeWire directly.
-
 mod app;
 mod cmd;
 mod pw;
-
 pub use app::{App, Phone, Status};
-
-/// Errors produced by the app.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     #[error("{0}")]
@@ -22,5 +15,4 @@ pub enum AudioError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
-
 pub type Result<T> = std::result::Result<T, AudioError>;

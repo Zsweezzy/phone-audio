@@ -9,3 +9,9 @@ license = "MIT"
 
 [profile.release]
 strip = true
+
+# Dev artifacts dominate target/ size: full debuginfo across all deps plus
+# incremental state grew past 5 GB. Line tables keep panic backtraces useful.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false

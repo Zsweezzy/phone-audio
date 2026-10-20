@@ -149,13 +149,14 @@ quickshell/PhoneAudio.qml quickshell shim (optional watch widget)
 
 ## For AI agents and contributors
 
-- Comments carry the "why". `//!` / `///` document the API; inline `//`
-  explains non-obvious behavior: PipeWire version quirks, race reasoning, the
-  scenario a test guards against. None of it is filler.
-- Keep existing comments verbatim. In particular the test file
-  (`crates/phone-audio-core/src/app/tests.rs`) narrates each scenario in `//`
-  — that narration is the spec. Move rationale only when you introduce it for
-  a new file and it fits a `//!` header better.
+- Source files stay comment-free. All rationale — PipeWire version quirks,
+  race reasoning, API docs — lives in [`COMMENTS.md`](COMMENTS.md), anchored
+  to the code line it documents. Add new rationale there, not inline.
+- Exception: test narration keeps its `//`. In particular
+  (`crates/phone-audio-core/src/app/tests.rs`) narrates each scenario — that
+  narration is the spec.
+- clap `--help` strings are expressed as `#[command(about = ...)]` /
+  `#[arg(help = ...)]` attributes, not comments, so help output survives.
 - Local tooling state is not tracked: `.opencode/` and `/.cocoindex_code/`
   (CocoIndex Code semantic index) are gitignored.
 

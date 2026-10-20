@@ -1,22 +1,11 @@
-//! Parsing helpers for the output of `pw-cli enum-params`, `pw-dump`, `wpctl`.
-
 use serde_json::{Map, Value};
-
-/// One entry of a `pw-cli enum-params <id> EnumProfile` block.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     pub index: u32,
     pub name: String,
-    /// `available: Id 2` means the profile is available (SPA_PARAM_AVAILABILITY_yes).
     pub available: bool,
-    /// The block's `classes` struct contains `String "Audio/Source"`.
     pub has_source: bool,
 }
-
-/// Profile names that receive phone (remote) audio. Bluez cards emit
-/// class-less `EnumProfile` blocks (PipeWire 1.6.x), so a profile is also
-/// receive-capable when its name is in this list — not just when it exposes an
-/// `Audio/Source` class. Single source of truth for profile-name matching.
 pub const RECEIVE_PROFILES: [&str; 6] = [
     "a2dp-source",
     "a2dp-duplex",
@@ -25,16 +14,6 @@ pub const RECEIVE_PROFILES: [&str; 6] = [
     "headset-audio-gateway",
     "handsfree",
 ];
-
-/// Parse `pw-cli enum-params ... EnumProfile` text (the pod-dump format) into
-/// profile blocks. Tolerant: only looks for the interesting lines.
-///
-/// A new profile starts at a line containing both `Object:` and `Param:Profile`;
-/// any other `Object:` line (a foreign block) closes the current profile so its
-/// props cannot leak into a neighboring one. Within a profile, `Prop: key
-/// ...:index/name/available` lines are followed by `Int N` / `String "..."` /
-/// `Id N` value lines. `Audio/Source` appearing in the block marks the profile
-/// as source-capable.
 pub fn parse_profiles(text: &str) -> Vec<Profile> {
     let mut out = Vec::new();
     let mut cur: Option<Profile> = None;
@@ -60,7 +39,6 @@ pub fn parse_profiles(text: &str) -> Vec<Profile> {
         }
         let Some(p) = cur.as_mut() else { continue };
         if let Some(rest) = t.strip_prefix("Prop: key") {
-            // `Spa:Pod:Object:Param:Profile:index (1), flags ...` -> `index`
             key = rest
                 .split('(')
                 .next()
@@ -84,7 +62,6 @@ pub fn parse_profiles(text: &str) -> Vec<Profile> {
                 }
             }
             Some("available") => {
-                // `Id 2 (Spa:Enum:ParamAvailability:yes)` -> available yes
                 let mut it = t.split_whitespace();
                 if it.next() == Some("Id") {
                     p.available = it.next().and_then(|s| s.parse::<u32>().ok()) == Some(2);
@@ -98,11 +75,6 @@ pub fn parse_profiles(text: &str) -> Vec<Profile> {
     }
     out
 }
-
-/// Pick the profile that receives phone (remote) audio:
-/// available `a2dp-source`, else `a2dp-duplex`, else `audio-gateway`, else any
-/// available source-capable profile (Audio/Source class **or** name in
-/// [`RECEIVE_PROFILES`]), preferring `a2dp`-named ones over the first capable.
 pub fn pick_receive_profile(profiles: &[Profile]) -> Option<&Profile> {
     let named = |name: &str| profiles.iter().find(|p| p.available && p.name == name);
     let capable: Vec<&Profile> = profiles
@@ -115,34 +87,23 @@ pub fn pick_receive_profile(profiles: &[Profile]) -> Option<&Profile> {
         .or_else(|| capable.iter().find(|p| p.name.contains("a2dp")).copied())
         .or_else(|| capable.first().copied())
 }
-
-/// Extract the volume float from `wpctl get-volume` output (e.g. `Volume: 0.65`).
 pub fn parse_volume(text: &str) -> Option<f64> {
     text.lines()
         .find_map(|l| l.trim().strip_prefix("Volume:")?.trim().parse::<f64>().ok())
         .map(|v| v.clamp(0.0, 1.0))
 }
-
-/// `info.props` of a pw-dump object.
 pub fn props(v: &Value) -> Option<&Map<String, Value>> {
     v.get("info")?.get("props")?.as_object()
 }
-
-/// The pipewire object type string ("PipeWire:Interface:Device", ...).
 pub fn obj_type(v: &Value) -> Option<&str> {
     v.get("type").and_then(|t| t.as_str())
 }
-
-/// The pipewire object id.
 pub fn obj_id(v: &Value) -> u32 {
     v.get("id").and_then(|x| x.as_u64()).unwrap_or(0) as u32
 }
-
-/// `28:8F:F6:71:6F:6E` -> `28_8F_F6_71_6F_6E` (the form used in node/device names).
 pub fn mac_underscored(mac: &str) -> String {
     mac.replace(':', "_")
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

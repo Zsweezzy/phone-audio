@@ -1,13 +1,6 @@
-//! phone-audio command-line interface.
-//!
-//! Wire the phone's audio into the PC: `phone-audio on`, `phone-audio off`,
-//! `phone-audio status`, `phone-audio volume 80`, `phone-audio set-phone`.
-
-use std::process::ExitCode;
-
 use clap::{Parser, Subcommand};
 use phone_audio_core::{App, Status};
-
+use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "phone-audio",
@@ -18,40 +11,38 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
-
 #[derive(Subcommand)]
 enum Command {
-    /// Show current status (phone, profile, loopback, volume)
+    #[command(about = "Show current status (phone, profile, loopback, volume)")]
     Status {
-        /// Emit machine-readable JSON
-        #[arg(long)]
+        #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
-    /// List connected bluetooth phones
+    #[command(about = "List connected bluetooth phones")]
     List {
-        /// Emit machine-readable JSON
-        #[arg(long)]
+        #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
-    /// Remember which phone to use (name or MAC)
+    #[command(about = "Remember which phone to use (name or MAC)")]
     SetPhone { name_or_mac: String },
-    /// Turn the phone's audio on (switch profile + start loopback)
+    #[command(about = "Turn the phone's audio on (switch profile + start loopback)")]
     On,
-    /// Turn it off (stop loopback, drop profile)
+    #[command(about = "Turn it off (stop loopback, drop profile)")]
     Off,
-    /// Toggle on/off
+    #[command(about = "Toggle on/off")]
     Toggle,
-    /// Forget a remembered phone (stale last_seen) — status then reports no phone
+    #[command(
+        about = "Forget a remembered phone (stale last_seen) — status then reports no phone"
+    )]
     Forget,
-    /// Set volume 0-100 percent
+    #[command(about = "Set volume 0-100 percent")]
     Volume {
         #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
         percent: u8,
     },
-    /// Multi-line troubleshooting dump
+    #[command(about = "Multi-line troubleshooting dump")]
     Debug,
 }
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli.command) {
@@ -62,7 +53,6 @@ fn main() -> ExitCode {
         }
     }
 }
-
 fn run(cmd: Command) -> phone_audio_core::Result<()> {
     let mut app = App::new()?;
     match cmd {
@@ -112,7 +102,6 @@ fn run(cmd: Command) -> phone_audio_core::Result<()> {
     }
     Ok(())
 }
-
 fn print_status(s: &Status) {
     if !s.available {
         println!("no phone: {}", s.reason);
